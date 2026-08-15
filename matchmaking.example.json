@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Copy to $NPLN_DATA_DIR/matchmaking.json.",
+    "Splatoon 3 asks for a NAMED matchmaking config and the server decides what it means: how many",
+    "players a match needs and accepts. Nintendo configures that server-side, so the game never tells",
+    "us — which is why it lives here and not in the code.",
+    "Matching is on the LAST path segment, so 'regular' matches tenants/…/matchmakingConfigs/regular.",
+    "You will not know the real names until you test: run once, and every unknown config is logged",
+    "exactly as the game asks for it. See docs/MATCHMAKING.md.",
+    "The counts below assume 4v4 versus modes and 4-player Salmon Run."
+  ],
+
+  "configs": [
+    { "name": "regular", "min_players": 8, "max_players": 8, "comment": "Turf War, 4v4" },
+    { "name": "bankara", "min_players": 8, "max_players": 8, "comment": "Anarchy, 4v4" },
+    { "name": "x",       "min_players": 8, "max_players": 8, "comment": "X Battle, 4v4" },
+    { "name": "league",  "min_players": 8, "max_players": 8, "comment": "Event battle" },
+    { "name": "coop",    "min_players": 4, "max_players": 4, "comment": "Salmon Run" },
+    { "name": "private", "min_players": 1, "max_players": 10, "comment": "Private battle: the host starts it manually" }
+  ]
+}
