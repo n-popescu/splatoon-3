@@ -1,0 +1,249 @@
+
+syntax = "proto3";
+
+package nn.npln.leaderboard.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "proto/leaderboard/v1/resources.proto";
+
+message Leaderboard {
+	enum UpdateType {
+		UPDATE_TYPE_UNSPECIFIED = 0;
+		EXCEED = 1;
+		ALWAYS = 2;
+	}
+	
+	string season = 1;
+	repeated Score scores = 2;
+	string prev_page_token = 3;
+	string next_page_token = 4;
+	google.protobuf.Timestamp rank_update_time = 5;
+	int32 total_count = 6;
+	google.protobuf.Timestamp season_start_time = 7;
+	google.protobuf.Timestamp season_end_time = 8;
+	bool score_order_asc = 9;
+	bool update_time_order_asc = 10;
+	UpdateType update_type = 11;
+	ShrinkState shrink_state = 12;
+}
+
+message NearLeaderboardFilter {
+	string target_holder = 1;
+	int32 page_size = 2;
+	string page_token = 3;
+}
+
+message RangeLeaderboardFilter {
+	int32 offset = 1;
+	int32 page_size = 2;
+	string page_token = 3;
+	string move_top_holder = 4;
+}
+
+message UserLeaderboardFilter {
+	repeated string holders = 1;
+	string order_by = 2;
+}
+
+message FindRankScore {
+	string request_score = 1;
+	bool found = 2;
+	Score rank_score = 3;
+}
+
+message PercentileScore {
+	double request_percentile = 1;
+	Score score = 2;
+}
+
+message QuantileScore {
+	string season = 1;
+	double quantile = 2;
+	int64 score = 3;
+	google.protobuf.Timestamp rank_update_time = 4;
+}
+
+message CreateHolderRequest {
+	string parent = 1;
+	Holder holder = 2;
+}
+
+message UpdateHolderRequest {
+	Holder holder = 1;
+	google.protobuf.FieldMask update_mask = 2;
+}
+
+message GetHolderRequest {
+	string name = 1;
+}
+
+message SearchHoldersRequest {
+	string parent = 1;
+	repeated string owners = 2;
+	string filter = 3;
+	int32 page_size = 4;
+	string page_token = 5;
+}
+
+message SearchHoldersResponse {
+	repeated Holder holders = 1;
+	string next_page_token = 2;
+}
+
+message DeleteHolderRequest {
+	string name = 1;
+}
+
+message RegisterScoreRequest {
+	Score score = 1;
+	bool force = 2;
+}
+
+message GetScoreRequest {
+	string name = 1;
+}
+
+message DeleteScoreRequest {
+	string name = 1;
+}
+
+message BrowseLeaderboardRequest {
+	string season = 1;
+	oneof filter {
+		UserLeaderboardFilter user_leaderboard = 3;
+		NearLeaderboardFilter near_leaderboard = 4;
+		RangeLeaderboardFilter range_leaderboard = 5;
+	}
+}
+
+message BrowseLeaderboardResponse {
+	Leaderboard leaderboard = 1;
+}
+
+message BrowseIndexesLeaderboardRequest {
+	string season = 1;
+	repeated int32 indexes = 2 [packed=true];
+}
+
+message BrowseIndexesLeaderboardResponse {
+	Leaderboard leaderboard = 1;
+}
+
+message PurgeScoreHoldersRequest {
+	string season = 1;
+	string filter = 2;
+	string holder = 3;
+	bool force = 4;
+}
+
+message PurgeScoreHoldersResponse {
+	int32 purge_count = 1;
+	repeated string purge_sample = 2;
+}
+
+message PurgeUserScoresRequest {
+	string user = 1;
+	bool force = 2;
+}
+
+message PurgeUserScoresResponse {
+	int32 purge_count = 1;
+	repeated string purge_sample = 2;
+}
+
+message GetCategoryRequest {
+	string name = 1;
+}
+
+message GetChartRequest {
+	string name = 1;
+}
+
+message BatchGetChartsRequest {
+	string parent = 1;
+	repeated string names = 2;
+}
+
+message BatchGetChartsResponse {
+	repeated Chart charts = 1;
+}
+
+message FetchRankScoreRequest {
+	string score = 1;
+}
+
+message FetchRankScoreResponse {
+	Score rank_score = 1;
+}
+
+message FindRankScoresRequest {
+	string season = 1;
+	repeated string names = 2;
+}
+
+message FindRankScoresResponse {
+	repeated FindRankScore find_rank_scores = 1;
+}
+
+message RetrieveScoresByPercentilesRequest {
+	string season = 1;
+	double percentile = 2;
+}
+
+message RetrieveScoresByPercentilesResponse {
+	repeated PercentileScore percentile_score = 1;
+	google.protobuf.Timestamp rank_update_time = 3;
+}
+
+message RetrieveQuantileScoresRequest {
+	string season = 1;
+	repeated QuantileScore quantile_scores = 2;
+}
+
+message RetrieveQuantileScoresResponse {
+	repeated QuantileScore quantile_scores = 1;
+}
+
+message GetSeasonRequest {
+	string name = 1;
+}
+
+message EstimateScoreRankRequest {
+	string season = 1;
+	int64 score = 2;
+}
+
+message EstimateScoreRankResponse {
+	EstimatedScoreRank estimated_score_rank = 1;
+}
+
+message EstimatedScoreRank {
+	int64 score = 1;
+	int64 estimated_rank = 2;
+}
+
+service LeaderboardService {
+	rpc CreateHolder(CreateHolderRequest) returns (Holder);
+	rpc UpdateHolder(UpdateHolderRequest) returns (Holder);
+	rpc GetHolder(GetHolderRequest) returns (Holder);
+	rpc SearchHolders(SearchHoldersRequest) returns (SearchHoldersResponse);
+	rpc DeleteHolder(DeleteHolderRequest) returns (google.protobuf.Empty);
+	rpc RegisterScore(RegisterScoreRequest) returns (Score);
+	rpc GetScore(GetScoreRequest) returns (Score);
+	rpc DeleteScore(DeleteScoreRequest) returns (google.protobuf.Empty);
+	rpc BrowseLeaderboard(BrowseLeaderboardRequest) returns (BrowseLeaderboardResponse);
+	rpc BrowseIndexesLeaderboard(BrowseIndexesLeaderboardRequest) returns (BrowseIndexesLeaderboardResponse);
+	rpc PurgeScoreHolders(PurgeScoreHoldersRequest) returns (PurgeScoreHoldersResponse);
+	rpc PurgeUserScores(PurgeUserScoresRequest) returns (PurgeUserScoresResponse);
+	rpc GetCategory(GetCategoryRequest) returns (Category);
+	rpc GetChart(GetChartRequest) returns (Chart);
+	rpc BatchGetCharts(BatchGetChartsRequest) returns (BatchGetChartsResponse);
+	rpc FetchRankScore(FetchRankScoreRequest) returns (FetchRankScoreResponse);
+	rpc FindRankScores(FindRankScoresRequest) returns (FindRankScoresResponse);
+	rpc RetrieveScoresByPercentiles(RetrieveScoresByPercentilesRequest) returns (RetrieveScoresByPercentilesResponse); // Removed in 1.45.0
+	rpc RetrieveQuantileScores(RetrieveQuantileScoresRequest) returns (RetrieveQuantileScoresResponse);
+	rpc GetSeason(GetSeasonRequest) returns (Season);
+	rpc EstimateScoreRank(EstimateScoreRankRequest) returns (EstimateScoreRankResponse);
+}
