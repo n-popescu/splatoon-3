@@ -1,0 +1,115 @@
+From 9b29ae0a44a023f3682417442e7c7bd5a22dc5ac Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 16:48:34 +0000
+Subject: [PATCH] router: route NPLN traffic (Splatoon 3) to its own backend
+
+*.npln.srv.nintendo.net is the NPLN service host used by Splatoon 3.
+Without an explicit route it falls through to BACKEND_DEFAULT, which is
+a NEX authentication server and cannot speak gRPC/HTTP2, so the console
+gets a TLS session that immediately errors out.
+
+Add BACKEND_NPLN so the NPLN host is routed to the Splatoon 3 server.
+---
+ main.go        | 17 +++++++++++++----
+ router_test.go | 19 ++++++++++++++++++-
+ 2 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/main.go b/main.go
+index 500889d..516daa6 100644
+--- a/main.go
++++ b/main.go
+@@ -6,6 +6,7 @@
+ //	g2b309e01-...srv.nintendo.net  -> MK8 auth   (BACKEND_MK8)
+ //	g23380901-...srv.nintendo.net  -> SSBU auth  (BACKEND_SSBU)
+ //	g25c08801-...srv.nintendo.net  -> ARMS auth  (BACKEND_ARMS)
++//	*.npln.srv.nintendo.net        -> NPLN       (BACKEND_NPLN, e.g. Splatoon 3)
+ //	*.ndas.srv.nintendo.net        -> nx-dauth   (BACKEND_DAUTH)
+ //	*.dragons.nintendo.net         -> nx-dauth   (BACKEND_DAUTH)
+ //	anything else                  -> BACKEND_DEFAULT (MK8 by default)
+@@ -36,14 +37,20 @@ func main() {
+ 	ssbu := envOr("BACKEND_SSBU", "127.0.0.1:8444")
+ 	arms := envOr("BACKEND_ARMS", "127.0.0.1:8445")
+ 	dauth := envOr("BACKEND_DAUTH", "127.0.0.1:8446")
++	// NPLN tenants (Splatoon 3 and any other NPLN title). These do NOT speak NEX: the
++	// host is <tenant>.lp1.t.npln.srv.nintendo.net and the backend serves gRPC over
++	// HTTP/2. Without a rule of its own that traffic fell through to BACKEND_DEFAULT —
++	// a NEX auth server — which answers a TLS handshake and then nothing the client
++	// understands, so the game just fails with no useful log on either side.
++	npln := envOr("BACKEND_NPLN", "")
+ 	def := envOr("BACKEND_DEFAULT", mk8)
+ 
+ 	ln, err := net.Listen("tcp", listen)
+ 	if err != nil {
+ 		log.Fatalf("listen %s: %v", listen, err)
+ 	}
+-	log.Printf("SNI router on %s -> mk8=%s ssbu=%s arms=%s dauth=%s default=%s (proxy-protocol=%v)",
+-		listen, mk8, ssbu, arms, dauth, def, sendProxyHeader())
++	log.Printf("SNI router on %s -> mk8=%s ssbu=%s arms=%s dauth=%s npln=%q default=%s (proxy-protocol=%v)",
++		listen, mk8, ssbu, arms, dauth, npln, def, sendProxyHeader())
+ 
+ 	// Accept errors used to `continue` unconditionally. A TEMPORARY error (the process is
+ 	// out of file descriptors, which is exactly what happens when connections leak — see the
+@@ -66,7 +73,7 @@ func main() {
+ 			continue
+ 		}
+ 		delay = 5 * time.Millisecond
+-		go handle(c, mk8, ssbu, arms, dauth, def)
++		go handle(c, mk8, ssbu, arms, dauth, npln, def)
+ 	}
+ }
+ 
+@@ -120,7 +127,7 @@ func proxyHeaderV1(c net.Conn) []byte {
+ 	return []byte(fmt.Sprintf("PROXY %s %s %s %d %d\r\n", family, srcIP, dstIP, src.Port, dst.Port))
+ }
+ 
+-func handle(c net.Conn, mk8, ssbu, arms, dauth, def string) {
++func handle(c net.Conn, mk8, ssbu, arms, dauth, npln, def string) {
+ 	defer c.Close()
+ 
+ 	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+@@ -136,6 +143,8 @@ func handle(c net.Conn, mk8, ssbu, arms, dauth, def string) {
+ 			backend = ssbu
+ 		case strings.Contains(sni, "g25c08801"):
+ 			backend = arms
++		case npln != "" && strings.Contains(sni, "npln.srv.nintendo.net"):
++			backend = npln
+ 		case strings.Contains(sni, "ndas.srv.nintendo.net"), strings.Contains(sni, "dragons.nintendo.net"):
+ 			backend = dauth
+ 		}
+diff --git a/router_test.go b/router_test.go
+index 7d3193f..15e61de 100644
+--- a/router_test.go
++++ b/router_test.go
+@@ -72,7 +72,7 @@ func TestProxyHeaderIsSentBeforeTheClientHello(t *testing.T) {
+ 	go handle(&addrConn{Conn: server,
+ 		remote: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 51234},
+ 		local:  &net.TCPAddr{IP: net.ParseIP("198.51.100.2"), Port: 443},
+-	}, backend.Addr().String(), "", "", "", backend.Addr().String())
++	}, backend.Addr().String(), "", "", "", "", backend.Addr().String())
+ 
+ 	select {
+ 	case r := <-got:
+@@ -161,3 +161,20 @@ type addrConn struct {
+ 
+ func (a *addrConn) RemoteAddr() net.Addr { return a.remote }
+ func (a *addrConn) LocalAddr() net.Addr  { return a.local }
++
++// TestNPLNRouting: Splatoon 3 (and any NPLN title) reaches
++// <tenant>.lp1.t.npln.srv.nintendo.net, which does NOT speak NEX. Without a rule of its
++// own that traffic fell through to BACKEND_DEFAULT — a NEX auth server — which completes
++// the TLS handshake and then says nothing the client understands.
++func TestNPLNRouting(t *testing.T) {
++	const s3 = "t-dce9377b-lp1.lp1.t.npln.srv.nintendo.net"
++	if !strings.Contains(s3, "npln.srv.nintendo.net") {
++		t.Fatal("the Splatoon 3 tenant host no longer matches the NPLN rule")
++	}
++	// The NEX rules must NOT claim it.
++	for _, nex := range []string{"g2b309e01", "g23380901", "g25c08801", "ndas.srv.nintendo.net", "dragons.nintendo.net"} {
++		if strings.Contains(s3, nex) {
++			t.Errorf("the NPLN host also matches the NEX rule %q", nex)
++		}
++	}
++}
+-- 
+2.43.0
+
