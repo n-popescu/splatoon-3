@@ -108,6 +108,16 @@ type Config struct {
 	// PresenceReportInterval is how often the set of players currently in
 	// Splatoon 3 is pushed to nextendo-account so the Switch friend list and
 	// the other games see them online.
+	// GhostIdle is how long a player with no RPC still counts as playing.
+	//
+	// It MUST agree with nextendo-account's ghostIdleSeconds, because the two are
+	// the opposite ends of the "one place at a time" gate: the account server polls
+	// /api/stats and ignores a player idle for longer than ITS threshold. If ours is
+	// longer, a player who quit stays "playing Splatoon 3" and is refused entry to
+	// Splatoon 2; if ours is shorter, the gate lets the same account play twice. So
+	// it reads the same variable, with the same default.
+	GhostIdle time.Duration
+
 	PresenceReportInterval time.Duration
 	// PresenceTTL drops a player from that set when their client stops sending
 	// PresenceService.KeepAlive.
@@ -173,13 +183,15 @@ func Load() (*Config, error) {
 		DefaultMaxPlayers: envInt("NPLN_MATCH_MAX_PLAYERS", 8),
 		SessionTTL:        envDuration("NPLN_SESSION_TTL", 2*time.Minute),
 
-		StunHost:    env("NPLN_STUN_HOST", ""),
+		StunHost:    env("NPLN_STUN_HOST", os.Getenv("NEXTENDO_HOST")),
 		StunPort:    envInt("NPLN_STUN_PORT", 3478),
-		TurnHost:    env("NPLN_TURN_HOST", ""),
+		TurnHost:    env("NPLN_TURN_HOST", os.Getenv("NEXTENDO_HOST")),
 		TurnPort:    envInt("NPLN_TURN_PORT", 3478),
 		TurnSecret:  os.Getenv("NPLN_TURN_SECRET"),
 		TurnCredTTL: envDuration("NPLN_TURN_CRED_TTL", time.Hour),
 		IceTTL:      envDuration("NPLN_ICE_TTL", 30*time.Minute),
+
+		GhostIdle: envSecondsOrDuration("NEXTENDO_GHOST_IDLE_SECONDS", 15*time.Minute),
 
 		PresenceReportInterval: envDuration("NPLN_PRESENCE_INTERVAL", 30*time.Second),
 		PresenceTTL:            envDuration("NPLN_PRESENCE_TTL", 90*time.Second),
@@ -211,6 +223,24 @@ func Load() (*Config, error) {
 		}
 	}
 	return c, nil
+}
+
+// envSecondsOrDuration reads a setting that the NEX servers express in bare
+// seconds (NEXTENDO_GHOST_IDLE_SECONDS=900) while this server's own variables use
+// Go durations. Both spellings are accepted so a fleet-wide value works here
+// unchanged, and "15m" works for anyone used to the NPLN_* variables.
+func envSecondsOrDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	return def
 }
 
 // httpAddr resolves the monitoring/UGC listener.

@@ -61,7 +61,7 @@ Configuration is entirely through environment variables — see [`example.env`](
 secrets are baked into the source.
 
 ```sh
-go build ./... && go test ./...    # 71 tests, all offline
+go build ./... && go test ./...    # 78 tests, all offline
 ```
 
 ## Ports

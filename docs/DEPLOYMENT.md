@@ -78,6 +78,18 @@ Splatoon-3-specific settings worth knowing about:
 | `NPLN_MAINTENANCE_START` / `_END` | — | RFC3339; while active, every RPC answers "under maintenance" |
 | `NEXTENDO_REQUIRE_SIGNED_TOKEN` | `0` | require the cryptographic account binding. Turn it on for an emulator-only deployment; a retail CFW Switch cannot provide it |
 
+Fleet-wide variables this server honours exactly as the NEX game servers do — see
+[INTEGRATION.md](INTEGRATION.md):
+
+| Variable | Meaning here |
+| --- | --- |
+| `NEXTENDO_PROXY_PROTOCOL=1` | read the real client IP from `sni-router`'s PROXY v1 header. **Required** if `SNI_SEND_PROXY_PROTOCOL=1` on the router, or TLS fails |
+| `NEXTENDO_HOST` | the deployment's public address; supplies the STUN/TURN default |
+| `NEXTENDO_GHOST_IDLE_SECONDS` | when an idle player stops counting as playing. Must match `nextendo-account`'s value |
+| `NEXTENDO_MAX_MESSAGE_BYTES` | cap on one received message (8 MiB default) |
+| `NEXTENDO_REVOKED_TOKENS` / `_FILE` | revoke leaked `nx2.` tokens by configuration |
+| `DASH_PORT` | the monitoring listener (`:8088` by default) |
+
 ## TURN credentials
 
 With `NPLN_TURN_SECRET` set, `AllocateIceServerSet` mints coturn REST-API credentials:

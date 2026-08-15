@@ -178,11 +178,14 @@ func main() {
 
 	// ---- monitoring -------------------------------------------------------
 	dash := dashboard.New(dashboard.Options{
-		Game:     "splatoon3",
-		Token:    cfg.DashToken,
-		Registry: registry,
-		Presence: hub,
-		UGC:      ugcStore,
+		Game:  "splatoon3",
+		Token: cfg.DashToken,
+		// Same threshold as nextendo-account's, so both ends of the "one place at
+		// a time" gate agree on when a session is a ghost.
+		GhostIdle: cfg.GhostIdle,
+		Registry:  registry,
+		Presence:  hub,
+		UGC:       ugcStore,
 	})
 	go func() {
 		if err := dash.Serve(cfg.HTTPAddr); err != nil {

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -55,8 +58,10 @@ func New(o Options) (*grpc.Server, error) {
 		}),
 		// The console's gRPC library is grpc-c++ 1.31; message sizes stay small
 		// except for cloud saves and UGC payloads, hence a generous but bounded
-		// receive limit.
-		grpc.MaxRecvMsgSize(8 << 20),
+		// receive limit. NEXTENDO_MAX_MESSAGE_BYTES is the fleet-wide knob for the
+		// same idea (audit F15 introduced it for NEX fragment reassembly), so one
+		// setting bounds one message everywhere.
+		grpc.MaxRecvMsgSize(maxMessageBytes()),
 	}
 	if o.LogUnknown {
 		opts = append(opts, grpc.UnknownServiceHandler(unknownHandler))
@@ -77,13 +82,33 @@ func New(o Options) (*grpc.Server, error) {
 	return grpc.NewServer(opts...), nil
 }
 
+// maxMessageBytes bounds one received message. NEXTENDO_MAX_MESSAGE_BYTES is
+// shared with the NEX servers; the 8 MiB default is this title's (cloud saves and
+// replay uploads are the only large payloads).
+func maxMessageBytes() int {
+	if v := strings.TrimSpace(os.Getenv("NEXTENDO_MAX_MESSAGE_BYTES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 8 << 20
+}
+
 // Listen starts serving. It blocks until the server stops.
+//
+// With NEXTENDO_PROXY_PROTOCOL=1 the listener is wrapped so the real client
+// address is read from the PROXY v1 header sni-router prepends — same variable,
+// same behaviour as the NEX servers. See proxyproto.go for why that matters.
 func Listen(srv *grpc.Server, addr string, tlsEnabled bool) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("server: listen %s: %w", addr, err)
 	}
-	log.Printf("[npln] gRPC listening on %s (tls=%v)", addr, tlsEnabled)
+	proxied := ProxyProtocolEnabled()
+	if proxied {
+		ln = &proxyListener{ln}
+	}
+	log.Printf("[npln] gRPC listening on %s (tls=%v proxy-protocol=%v)", addr, tlsEnabled, proxied)
 	return srv.Serve(ln)
 }
 

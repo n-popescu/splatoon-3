@@ -45,7 +45,39 @@ what the rest of this document is about.
 | Monitoring | `/api/stats` with the same JSON keys, gated by `DASH_TOKEN` with a constant-time compare; `/healthz` | `splatoon-2/dashboard.go` |
 | Port convention | `DASH_PORT`, default `:8088` | 8082 mk8 · 8083 s2 · 8084 ssbu · 8085 dash · 8086 acnh · 8087 mc |
 | TLS | `CERT_FILE` / `KEY_FILE` | every server |
+| Behind the router | `NEXTENDO_PROXY_PROTOCOL=1` reads the real client IP from the PROXY v1 header | `ListenSecureProxy` in `nextendo-nex` |
+| Public address | `NEXTENDO_HOST` supplies the STUN/TURN default | `NEXTENDO_HOST` in every server |
+| Ghost sessions | `NEXTENDO_GHOST_IDLE_SECONDS`, the **same variable** the account server uses | `nextendo-account/online_presence.go` |
+| Message bound | `NEXTENDO_MAX_MESSAGE_BYTES` caps one received message | `nextendo-nex` (audit F15) |
 | Licence | PolyForm Shield 1.0.0 | every repo |
+
+### The three that are more than cosmetic
+
+**`NEXTENDO_PROXY_PROTOCOL=1`.** `sni-router` forwards the encrypted stream unopened, so without
+this every player's IP in `/api/stats` is the router's. Worse: once `SNI_SEND_PROXY_PROTOCOL=1` is
+turned on for the fleet, a server that does not parse the header feeds the `PROXY …` line into the
+TLS handshake as if it were a ClientHello — TLS fails and the game reports a network error with
+nothing to explain it. Enabling a fleet-wide setting must not be able to break one title, so this
+server now honours the same switch, with the same deliberate pass-through: a connection that arrives
+*without* a header is served normally.
+
+**`NEXTENDO_GHOST_IDLE_SECONDS`.** This is the threshold on *both* ends of the "one place at a time"
+gate. `nextendo-account` polls `/api/stats` and ignores a player whose `idleSeconds` exceeds its own
+value; this server decides which players to publish. If the two disagree, the failure is specific and
+confusing: too long here and somebody who quit Splatoon 3 is refused entry to Splatoon 2; too short
+and the same account plays in two places. Same variable, same 15-minute default.
+
+**`NEXTENDO_HOST`.** Splatoon 3 hands STUN/TURN addresses to the console, and an unset STUN host means
+lobbies fill but matches never start. Reading the fleet's public-address variable means setting it
+once for the deployment is enough, instead of remembering two title-specific names.
+
+### What is deliberately *not* mapped
+
+`NEXTENDO_REAP_IDLE_SECONDS`, `NEXTENDO_FRAG_PACING_MS`, `NEXTENDO_PRUDP_MINOR`,
+`NEXTENDO_PROBE_REPOINT`, `NEXTENDO_AUTH_RECALL_FILE` and `NEXTENDO_COMMON_DATA_FILE` are PRUDP
+concepts — idle *connections*, fragment pacing, PRUDP versions, NAT probes, the auth→secure PID
+handover. NPLN has no equivalent, and inventing a second meaning for a known variable would be worse
+than not supporting it. Idle players here are governed by `NEXTENDO_GHOST_IDLE_SECONDS`.
 
 The `nnex` claim a console presents inside its BAAS `id_token` **is** an `nx2.` token, verified with
 the same HMAC construction as `LoginEx` uses (`nex:` + `pid.username.expiry`). That is why this
@@ -116,7 +148,7 @@ Kart World, Pokémon S/V, …) ever wants it; the import path is the only thing 
 ## 5. Verifying an integration
 
 ```sh
-go build ./... && go test ./...                     # 71 tests, all offline
+go build ./... && go test ./...                     # 78 tests, all offline
 curl "http://127.0.0.1:8088/api/stats?key=$DASH_TOKEN"
 go run ./cmd/npln-smoke -addr 127.0.0.1:50051       # a real gRPC login on the wire
 ```
