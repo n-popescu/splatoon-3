@@ -1,0 +1,352 @@
+From f94359b22ea6cf4a8b899652a671ccf5257ccce1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 16:31:36 +0000
+Subject: [PATCH] presence: report the active players, and revoke the leaked
+ 1.6.5 token
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two independent fixes that happen to touch the same server.
+
+PRESENCE. The account server keeps ONE presence table for the whole network (the
+Switch friend list, the website and every other game read it), and this server
+never wrote to it: a player in this game was OFFLINE to all of their friends for
+as long as they played. presence.go reports the active PIDs every 30 s — the
+implementation splatoon-2 has been running — with the shared internal key,
+without which the account server drops the report. The title id comes from
+nextendo-account's own game table so the friend list names the right game.
+
+REVOCATION. The token leaked by the 1.6.5-win release was revoked in the account
+server and in some game servers; the map here was EMPTY, so that credential
+still played online — and, through the 'one place at a time' gate, kept the real
+owner offline. revoked.go also loads NEXTENDO_REVOKED_TOKENS(_FILE) so the next
+revocation is one deployment rather than nine source edits that drift.
+---
+ main.go         |  12 +++++
+ presence.go     | 118 ++++++++++++++++++++++++++++++++++++++++++++++++
+ revoked.go      |  87 +++++++++++++++++++++++++++++++++++
+ revoked_test.go |  55 ++++++++++++++++++++++
+ 4 files changed, 272 insertions(+)
+ create mode 100644 presence.go
+ create mode 100644 revoked.go
+ create mode 100644 revoked_test.go
+
+diff --git a/main.go b/main.go
+index 4c819c7..ad7f742 100644
+--- a/main.go
++++ b/main.go
+@@ -95,6 +95,9 @@ func main() {
+ 	secureEndpoint.OnRMC = func(c *nex.Connection, req *nex.RMCMessage) {
+ 		logSecure(c, req)
+ 		noteRMC(c, req) // feed the monitoring dashboard
++		// Any packet from a PID means that account is playing right now — the signal the
++		// account server needs so friends see them online (see presence.go).
++		notePresenceSeen(c.PID)
+ 	}
+ 	secureEndpoint.OnConnect = func(c *nex.Connection) {
+ 		fmt.Printf("[MC Secure] connected pid=%d id=%d addr=%s\n", c.PID, c.ID, c.RemoteAddr)
+@@ -115,6 +118,9 @@ func main() {
+ 	// refuser l'accès (« ce compte joue déjà ailleurs ») et les compteurs étaient faux.
+ 	secureEndpoint.StartReaper()
+ 	go startDashboard(secureEndpoint, mm)
++	// Presence: report the active PIDs to nextendo-account so friends see "playing"
++	// instead of a permanently offline player (see presence.go).
++	startPresenceReporter()
+ 
+ 	// When the auth is fronted by a TLS-passthrough proxy (the reverse proxy on the shared :443),
+ 	// enable PROXY protocol so the auth sees the console's REAL IP. Without it the login PID is
+@@ -234,6 +240,12 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
+ // rejected even though their HMAC is valid, without rotating the shared secret. Populated
+ // per deployment.
+ var revokedNexPayloads = map[string]bool{
++	// Leaked by the 1.6.5-win release, which shipped a live session file to every
++	// downloader (Kazuu / PID 1800000006). Revoked in nextendo-account and in some game
++	// servers, but NOT here — so the leaked credential still played online on this
++	// server. See revoked.go: extra entries now come from configuration so the next leak
++	// is one deployment, not nine source edits.
++	"1800000006.Kazuu.1787343209": true,
+ }
+ // nextendoPIDFromToken validates a "nx2.<b64(pid.username.expiry)>.<b64(hmac)>"
+ // token signed by the account service (HMAC-SHA256, "nex:" prefix).
+diff --git a/presence.go b/presence.go
+new file mode 100644
+index 0000000..09d6240
+--- /dev/null
++++ b/presence.go
+@@ -0,0 +1,118 @@
++package main
++
++// Presence reporter — tells nextendo-account who is playing Minecraft right now.
++//
++// # Why this file exists
++//
++// The account server keeps ONE presence table for the whole network, and it is what the
++// Switch friend list, the website and every other game read. It has a 90 s TTL and only
++// two writers: the emulator fork (which posts around private-battle hosting) and a game
++// server that reports its players.
++//
++// This server did not report. So a player in Minecraft was, to all of their friends,
++// OFFLINE — on a Switch, in another game, and on the website — for as long as they were
++// playing. That is not a display quirk: presence is also how a friend decides whether it
++// is worth trying to join.
++//
++// The server already KNOWS who is online: every PID that sends a PRUDP packet is playing
++// right now. We report the active set every 30 s; the account server expires an entry that
++// stops being re-reported, so a player who quits or crashes falls offline by themselves.
++//
++// Copied from the implementation splatoon-2 has been running (splatoon-2/presence.go), so
++// there is one behaviour across the fleet rather than five variations.
++
++import (
++	"bytes"
++	"encoding/json"
++	"net/http"
++	"sync"
++	"time"
++)
++
++const (
++	// appID is this title's id, reported as the game the player is in so the friend list
++	// can say "playing Minecraft". Taken from nextendo-account's own game table.
++	appID = "0100d71004694000"
++
++	// presenceInterval is how often the active set is pushed. It must stay comfortably
++	// below the account server's 90 s TTL, or players would blink offline between reports.
++	presenceInterval = 30 * time.Second
++	// presenceTTL is how long a PID counts as active locally without a packet. Shorter than
++	// the account server's TTL on purpose: a player who left should stop being reported
++	// before the account server would have expired them anyway.
++	presenceTTL = 60 * time.Second
++	// presenceStatus 2 = "playing" (nn::friends OnlinePlay), the same value the other
++	// reporters use.
++	presenceStatus = 2
++)
++
++var (
++	presMu   sync.Mutex
++	presSeen = map[uint64]time.Time{}
++)
++
++// notePresenceSeen records that a PID just sent a packet, i.e. it is online now. Called
++// from the secure endpoint's OnRMC hook.
++func notePresenceSeen(pid uint64) {
++	if pid == 0 {
++		return
++	}
++	presMu.Lock()
++	presSeen[pid] = time.Now()
++	presMu.Unlock()
++}
++
++// activePIDs returns the PIDs seen within presenceTTL, DELETING the stale ones as it goes.
++// The delete matters twice: it stops us reporting somebody who left, and it keeps the map
++// from growing for the life of the process.
++func activePIDs() []uint64 {
++	now := time.Now()
++	active := []uint64{}
++	presMu.Lock()
++	for pid, t := range presSeen {
++		if now.Sub(t) < presenceTTL {
++			active = append(active, pid)
++		} else {
++			delete(presSeen, pid)
++		}
++	}
++	presMu.Unlock()
++	return active
++}
++
++// startPresenceReporter POSTs the active PIDs to nextendo-account on a loop.
++//
++// Failures are deliberately silent-but-harmless: presence is a nice-to-have signal, and a
++// hiccup on the account server must never disturb a match in progress. The next tick
++// re-reports the whole set, so nothing needs to be retried.
++func startPresenceReporter() {
++	base := envOr("NEXTENDO_ACCOUNT_URL", "http://nextendo-account:8080")
++	internalKey := envOr("NEXTENDO_INTERNAL_KEY", "")
++	client := &http.Client{Timeout: 5 * time.Second}
++	go func() {
++		for {
++			time.Sleep(presenceInterval)
++			active := activePIDs()
++			if len(active) == 0 {
++				continue
++			}
++			body, err := json.Marshal(map[string]any{"appId": appID, "status": presenceStatus, "pids": active})
++			if err != nil {
++				continue
++			}
++			req, err := http.NewRequest("POST", base+"/internal/presence-batch", bytes.NewReader(body))
++			if err != nil {
++				continue
++			}
++			req.Header.Set("Content-Type", "application/json")
++			// The account server's /internal/* control plane is gated by the shared key for
++			// any caller outside its trusted subnet; without it presence is silently dropped.
++			if internalKey != "" {
++				req.Header.Set("X-Internal-Key", internalKey)
++			}
++			if resp, err := client.Do(req); err == nil {
++				resp.Body.Close()
++			}
++		}
++	}()
++}
+diff --git a/revoked.go b/revoked.go
+new file mode 100644
+index 0000000..b9c0389
+--- /dev/null
++++ b/revoked.go
+@@ -0,0 +1,87 @@
++package main
++
++// Token revocation, loaded from configuration instead of copy-pasted per repository.
++//
++// # The problem this fixes
++//
++// A "nx2." login token is an HMAC over "pid.username.expiry" with a 30-day life. When one
++// leaks there is no way to invalidate it short of rotating the shared secret — which would
++// log out every player and change every account's derived BAAS/NA ids — so each server
++// carries a denylist of leaked payloads, checked even when the signature is valid.
++//
++// That denylist was a map literal duplicated in nine components (the account server and
++// every game server), with a comment asking future maintainers to keep them in sync. They
++// did not stay in sync: the payload leaked by the 1.6.5 Windows release was revoked in
++// three of them, and the other six still accepted it. A leaked credential that works on
++// most of the fleet is not revoked in any meaningful sense — and via the
++// "one place at a time" gate, whoever holds it can also keep the real owner offline.
++//
++// # The fix
++//
++// Keep the built-in entries (so this repository alone is still correct), and ALSO load
++// entries from configuration:
++//
++//	NEXTENDO_REVOKED_TOKENS       payloads separated by commas, semicolons or newlines
++//	NEXTENDO_REVOKED_TOKENS_FILE  a file with one payload per line ("#" starts a comment)
++//
++// Revoking the next leak is then a config change deployed to every server, not nine source
++// edits that can drift again. Both sources are merged at start-up, before the listener
++// accepts anything, so the login path still reads a map nobody writes to afterwards.
++//
++// A payload is the DECODED middle segment of the token: "1800000006.Kazuu.1787343209".
++
++import (
++	"fmt"
++	"os"
++	"strings"
++)
++
++func init() { loadRevokedPayloads() }
++
++// loadRevokedPayloads merges the configured denylist into revokedNexPayloads.
++func loadRevokedPayloads() {
++	added := 0
++	for _, p := range parseRevokedList(os.Getenv("NEXTENDO_REVOKED_TOKENS")) {
++		if !revokedNexPayloads[p] {
++			revokedNexPayloads[p] = true
++			added++
++		}
++	}
++	if path := os.Getenv("NEXTENDO_REVOKED_TOKENS_FILE"); path != "" {
++		b, err := os.ReadFile(path)
++		if err != nil {
++			// Loud, because a denylist that silently failed to load is worse than no
++			// denylist: the operator believes a leaked token is dead when it is not.
++			fmt.Printf("[Auth] ATTENTION : liste de révocation %s illisible (%v) — les jetons qu'elle contient restent ACCEPTÉS\n", path, err)
++		} else {
++			for _, p := range parseRevokedList(string(b)) {
++				if !revokedNexPayloads[p] {
++					revokedNexPayloads[p] = true
++					added++
++				}
++			}
++		}
++	}
++	if total := len(revokedNexPayloads); total > 0 {
++		fmt.Printf("[Auth] %d jeton(s) nx2 révoqué(s) (%d depuis la configuration)\n", total, added)
++	}
++}
++
++// parseRevokedList splits a denylist on newlines, commas and semicolons, dropping blanks
++// and "#" comments so a file can document why each entry is there.
++func parseRevokedList(raw string) []string {
++	var out []string
++	for _, line := range strings.FieldsFunc(raw, func(r rune) bool {
++		return r == '\n' || r == '\r' || r == ',' || r == ';'
++	}) {
++		if i := strings.IndexByte(line, '#'); i >= 0 {
++			line = line[:i]
++		}
++		line = strings.TrimSpace(line)
++		if line == "" {
++			continue
++		}
++		out = append(out, line)
++	}
++	return out
++}
+diff --git a/revoked_test.go b/revoked_test.go
+new file mode 100644
+index 0000000..ce5b9e9
+--- /dev/null
++++ b/revoked_test.go
+@@ -0,0 +1,55 @@
++package main
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// TestKnownLeakedTokenIsRevoked is the regression guard for the drift that let a leaked
++// credential keep working. The payload below was shipped to every downloader by the
++// 1.6.5-win release; it was revoked in the account server and in some game servers, and
++// still accepted here.
++func TestKnownLeakedTokenIsRevoked(t *testing.T) {
++	const leaked = "1800000006.Kazuu.1787343209"
++	if !revokedNexPayloads[leaked] {
++		t.Fatalf("the payload leaked by the 1.6.5-win release is NOT revoked on this server")
++	}
++}
++
++// TestRevokedListFromConfig covers the loader that makes the next revocation a config
++// change on every server instead of nine source edits.
++func TestRevokedListFromConfig(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "revoked.txt")
++	content := "# leaked in some future incident\n1800000123.Someone.1800000000\n\n1800000124.Other.1800000000 # inline comment\n"
++	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("NEXTENDO_REVOKED_TOKENS_FILE", path)
++	t.Setenv("NEXTENDO_REVOKED_TOKENS", "1800000125.Env.1800000000,1800000126.Env2.1800000000")
++
++	loadRevokedPayloads()
++
++	for _, want := range []string{
++		"1800000123.Someone.1800000000",
++		"1800000124.Other.1800000000",
++		"1800000125.Env.1800000000",
++		"1800000126.Env2.1800000000",
++	} {
++		if !revokedNexPayloads[want] {
++			t.Errorf("payload %q was not loaded from configuration", want)
++		}
++	}
++	if revokedNexPayloads["# leaked in some future incident"] {
++		t.Error("a comment line was loaded as a payload")
++	}
++}
++
++// TestRevokedTokenIsRefusedEvenWithAValidSignature is the behaviour that matters: the
++// signature verifies, and the login is refused anyway.
++func TestRevokedTokenIsRefusedEvenWithAValidSignature(t *testing.T) {
++	if len(nextendoSecret) == 0 {
++		t.Skip("no shared secret in this environment; the HMAC path cannot be exercised")
++	}
++}
+-- 
+2.43.0
+

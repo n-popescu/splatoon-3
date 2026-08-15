@@ -1,0 +1,350 @@
+From 38b1ac5c8cc19fdc884f7c2a2d13599db4a63ab9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 16:30:50 +0000
+Subject: [PATCH] router: send PROXY protocol, back off on accept errors, stop
+ leaking connections
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. PROXY protocol v1 (SNI_SEND_PROXY_PROTOCOL=1, off by default).
+
+   The backend terminates TLS itself, so the only thing it learns about the
+   client is the TCP peer — which, behind this router, is the ROUTER. That
+   breaks the NEX auth in a way that is invisible from the outside: the auth
+   server remembers the login PID keyed by the client IP (RememberAuthPID) and
+   the console's secure connection arrives DIRECTLY on the game's own port with
+   its real IP, so RecallAuthPID misses. A console that reaches the secure
+   server without a decryptable ticket is then refused, and the monitoring shows
+   the router's address and geolocation for every player.
+
+   nextendo-nex has parsed PROXY v1 for exactly this reason since it ran behind
+   Traefik (proxyproto.go, ListenSecureProxy, NEXTENDO_PROXY_PROTOCOL=1) — this
+   router, the project's own recommended front for sharing :443, never sent the
+   header, so that support had nothing to parse. Off by default because sending
+   the header to a backend that is not expecting it corrupts the TLS stream.
+
+2. The accept loop 'continue'd on every error. A temporary error — out of file
+   descriptors, which is precisely what (3) caused — repeats immediately, so the
+   loop spins at 100% CPU on a box that also runs the game servers, and never
+   recovers. Now: exponential back-off, and permanent errors are logged.
+
+3. handle() copied both directions but only waited on one, so a half-open
+   connection (a crash, a closed lid, a dropped Wi-Fi link) left one io.Copy
+   blocked forever — a goroutine and two file descriptors per abandoned
+   connection, for the life of the process, ending as 'too many open files'.
+   Both directions are now torn down when either finishes.
+
+Tests: the PROXY header matches the shape nextendo-nex parses (field order,
+TCP4/TCP6, CRLF); it is sent BEFORE the replayed ClientHello; it stays off
+unless enabled; and parseSNI survives every truncation of a ClientHello, which
+matters on a public :443 that scanners find.
+---
+ main.go        |  93 +++++++++++++++++++++++++++-
+ router_test.go | 163 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 253 insertions(+), 3 deletions(-)
+ create mode 100644 router_test.go
+
+diff --git a/main.go b/main.go
+index 84351d1..500889d 100644
+--- a/main.go
++++ b/main.go
+@@ -14,6 +14,7 @@ package main
+ import (
+ 	"encoding/binary"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"log"
+ 	"net"
+@@ -41,17 +42,84 @@ func main() {
+ 	if err != nil {
+ 		log.Fatalf("listen %s: %v", listen, err)
+ 	}
+-	log.Printf("SNI router on %s -> mk8=%s ssbu=%s arms=%s dauth=%s default=%s", listen, mk8, ssbu, arms, dauth, def)
++	log.Printf("SNI router on %s -> mk8=%s ssbu=%s arms=%s dauth=%s default=%s (proxy-protocol=%v)",
++		listen, mk8, ssbu, arms, dauth, def, sendProxyHeader())
+ 
++	// Accept errors used to `continue` unconditionally. A TEMPORARY error (the process is
++	// out of file descriptors, which is exactly what happens when connections leak — see the
++	// deadlines in handle) repeats immediately, so the loop spins at 100% CPU on a box that
++	// is also running the game servers, and it never recovers on its own. Back off, and give
++	// up only on a permanent error.
++	delay := 5 * time.Millisecond
+ 	for {
+ 		c, err := ln.Accept()
+ 		if err != nil {
++			var ne net.Error
++			if errors.As(err, &ne) && ne.Timeout() {
++				continue
++			}
++			log.Printf("accept: %v (retrying in %s)", err, delay)
++			time.Sleep(delay)
++			if delay < time.Second {
++				delay *= 2
++			}
+ 			continue
+ 		}
++		delay = 5 * time.Millisecond
+ 		go handle(c, mk8, ssbu, arms, dauth, def)
+ 	}
+ }
+ 
++// sendProxyHeader reports whether to prepend a PROXY-protocol v1 line to the backend.
++//
++// # Why this exists
++//
++// The backend terminates TLS itself, so the only thing it learns about the client is the TCP
++// peer — which, behind this router, is the ROUTER. That breaks the NEX auth in a way that is
++// hard to see from the outside: the auth server remembers the login PID keyed by the client
++// IP (RememberAuthPID), and the console's secure connection arrives DIRECTLY on the game's
++// own port with its real IP, so RecallAuthPID misses. A console that reaches the secure
++// server without a decryptable ticket is then refused (or, in older builds, inherited a
++// placeholder PID and the session it hosted was owned by a phantom — error 2618-562).
++//
++// nextendo-nex already parses PROXY v1 (proxyproto.go, ListenSecureProxy, enabled per game
++// with NEXTENDO_PROXY_PROTOCOL=1) because the deployment used to sit behind Traefik. This
++// router — the project's own recommended front for sharing :443 — never sent the header, so
++// that support had nothing to parse.
++//
++// Off by default: sending the header to a backend that is not expecting it would corrupt the
++// TLS stream. Turn it on together with NEXTENDO_PROXY_PROTOCOL=1 on the game servers.
++func sendProxyHeader() bool {
++	switch strings.ToLower(strings.TrimSpace(os.Getenv("SNI_SEND_PROXY_PROTOCOL"))) {
++	case "1", "true", "yes", "on":
++		return true
++	}
++	return false
++}
++
++// proxyHeaderV1 formats the PROXY-protocol v1 line for a connection:
++//
++//	PROXY TCP4 <src ip> <dst ip> <src port> <dst port>\r\n
++//
++// It returns nil when either address is not TCP/IP, so an unexpected transport degrades to
++// "no header" rather than to a malformed one.
++func proxyHeaderV1(c net.Conn) []byte {
++	src, ok1 := c.RemoteAddr().(*net.TCPAddr)
++	dst, ok2 := c.LocalAddr().(*net.TCPAddr)
++	if !ok1 || !ok2 || src.IP == nil || dst.IP == nil {
++		return nil
++	}
++	family := "TCP4"
++	if src.IP.To4() == nil {
++		family = "TCP6"
++	}
++	srcIP, dstIP := src.IP.String(), dst.IP.String()
++	if family == "TCP4" {
++		srcIP, dstIP = src.IP.To4().String(), dst.IP.To4().String()
++	}
++	return []byte(fmt.Sprintf("PROXY %s %s %s %d %d\r\n", family, srcIP, dstIP, src.Port, dst.Port))
++}
++
+ func handle(c net.Conn, mk8, ssbu, arms, dauth, def string) {
+ 	defer c.Close()
+ 
+@@ -81,11 +149,30 @@ func handle(c net.Conn, mk8, ssbu, arms, dauth, def string) {
+ 	}
+ 	defer up.Close()
+ 
++	// PROXY v1 first, before the replayed ClientHello: the backend reads the header, then
++	// speaks TLS with the real client address recorded (see sendProxyHeader).
++	if sendProxyHeader() {
++		if hdr := proxyHeaderV1(c); hdr != nil {
++			if _, err := up.Write(hdr); err != nil {
++				return
++			}
++		}
++	}
++
+ 	if _, err := up.Write(hello); err != nil { // replay the buffered ClientHello
+ 		return
+ 	}
+-	go func() { _, _ = io.Copy(up, c) }()
+-	_, _ = io.Copy(c, up)
++
++	// Both directions are copied, and BOTH ends are closed when either finishes. Without
++	// that, a half-open connection (a console that vanished — a crash, a closed lid, a
++	// dropped Wi-Fi link) left one io.Copy blocked forever: one goroutine, two sockets and
++	// two file descriptors per abandoned connection, for the life of the process. On a
++	// long-running router that ends as "accept: too many open files", which the accept loop
++	// above then spun on.
++	done := make(chan struct{}, 2)
++	go func() { _, _ = io.Copy(up, c); done <- struct{}{} }()
++	go func() { _, _ = io.Copy(c, up); done <- struct{}{} }()
++	<-done
+ }
+ 
+ // peekClientHello reads the first TLS record (the ClientHello), returns the raw
+diff --git a/router_test.go b/router_test.go
+new file mode 100644
+index 0000000..7d3193f
+--- /dev/null
++++ b/router_test.go
+@@ -0,0 +1,163 @@
++package main
++
++import (
++	"bufio"
++	"io"
++	"net"
++	"strings"
++	"testing"
++	"time"
++)
++
++// TestProxyHeaderV1 checks the header the backend's parser expects. nextendo-nex reads
++// "PROXY TCP4 <src> <dst> <srcPort> <dstPort>" (proxyproto.go), so the field order and the
++// CRLF terminator are part of the contract.
++func TestProxyHeaderV1(t *testing.T) {
++	c := &fakeConn{
++		remote: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 51234},
++		local:  &net.TCPAddr{IP: net.ParseIP("198.51.100.2"), Port: 443},
++	}
++	got := string(proxyHeaderV1(c))
++	want := "PROXY TCP4 203.0.113.9 198.51.100.2 51234 443\r\n"
++	if got != want {
++		t.Fatalf("header = %q, want %q", got, want)
++	}
++	// The same parser only accepts TCP4/TCP6, so an IPv6 client must be announced as TCP6.
++	c6 := &fakeConn{
++		remote: &net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 5000},
++		local:  &net.TCPAddr{IP: net.ParseIP("2001:db8::2"), Port: 443},
++	}
++	if !strings.HasPrefix(string(proxyHeaderV1(c6)), "PROXY TCP6 ") {
++		t.Errorf("IPv6 header = %q", string(proxyHeaderV1(c6)))
++	}
++}
++
++// TestProxyHeaderIsSentBeforeTheClientHello: order matters — the backend reads the header
++// first, then starts TLS. Getting it wrong corrupts the handshake instead of failing loudly.
++func TestProxyHeaderIsSentBeforeTheClientHello(t *testing.T) {
++	t.Setenv("SNI_SEND_PROXY_PROTOCOL", "1")
++
++	backend, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer backend.Close()
++
++	type result struct {
++		header string
++		first  byte
++	}
++	got := make(chan result, 1)
++	go func() {
++		conn, err := backend.Accept()
++		if err != nil {
++			return
++		}
++		defer conn.Close()
++		br := bufio.NewReader(conn)
++		line, _ := br.ReadString('\n')
++		b, _ := br.ReadByte()
++		got <- result{header: line, first: b}
++	}()
++
++	// A minimal TLS ClientHello record with an SNI extension is not needed here: handle()
++	// forwards whatever the first record contained, and we only assert the ORDER.
++	client, server := net.Pipe()
++	go func() {
++		defer client.Close()
++		// record header: handshake, TLS 1.2, length 4 — then a 4-byte body.
++		_, _ = client.Write([]byte{0x16, 0x03, 0x03, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00})
++		_, _ = io.Copy(io.Discard, client)
++	}()
++	go handle(&addrConn{Conn: server,
++		remote: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 51234},
++		local:  &net.TCPAddr{IP: net.ParseIP("198.51.100.2"), Port: 443},
++	}, backend.Addr().String(), "", "", "", backend.Addr().String())
++
++	select {
++	case r := <-got:
++		if !strings.HasPrefix(r.header, "PROXY TCP4 203.0.113.9 ") {
++			t.Fatalf("backend read %q first, want the PROXY header", r.header)
++		}
++		if r.first != 0x16 {
++			t.Fatalf("byte after the header = %#x, want 0x16 (the replayed TLS record)", r.first)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("the backend never received anything")
++	}
++}
++
++// TestNoProxyHeaderByDefault: sending the header to a backend that is not expecting it would
++// corrupt the TLS stream, so it must stay off unless explicitly enabled.
++func TestNoProxyHeaderByDefault(t *testing.T) {
++	t.Setenv("SNI_SEND_PROXY_PROTOCOL", "")
++	if sendProxyHeader() {
++		t.Fatal("the PROXY header is enabled by default")
++	}
++	for _, v := range []string{"1", "true", "on", "YES"} {
++		t.Setenv("SNI_SEND_PROXY_PROTOCOL", v)
++		if !sendProxyHeader() {
++			t.Errorf("SNI_SEND_PROXY_PROTOCOL=%q did not enable the header", v)
++		}
++	}
++}
++
++// TestParseSNI keeps the ClientHello parser honest, including the truncated inputs a scanner
++// will send at a public :443.
++func TestParseSNI(t *testing.T) {
++	hello := buildClientHello("g2b309e01-lp1.s.n.srv.nintendo.net")
++	if got := parseSNI(hello); got != "g2b309e01-lp1.s.n.srv.nintendo.net" {
++		t.Fatalf("parseSNI = %q", got)
++	}
++	// Truncations must return "" rather than panic: the router is reachable by anything.
++	for i := 0; i < len(hello); i++ {
++		func() {
++			defer func() {
++				if r := recover(); r != nil {
++					t.Fatalf("parseSNI panicked on a %d-byte prefix: %v", i, r)
++				}
++			}()
++			_ = parseSNI(hello[:i])
++		}()
++	}
++}
++
++// buildClientHello builds the handshake body parseSNI expects (it is handed the record body,
++// not the record header).
++func buildClientHello(host string) []byte {
++	var ext []byte
++	name := []byte(host)
++	sni := append([]byte{0x00}, byte(len(name)>>8), byte(len(name))) // name type + length
++	sni = append(sni, name...)
++	serverNameList := append([]byte{byte(len(sni) >> 8), byte(len(sni))}, sni...)
++	ext = append(ext, 0x00, 0x00) // extension type: server_name
++	ext = append(ext, byte(len(serverNameList)>>8), byte(len(serverNameList)))
++	ext = append(ext, serverNameList...)
++
++	b := []byte{0x01, 0x00, 0x00, 0x00} // ClientHello + 3-byte length (unused by parseSNI)
++	b = append(b, 0x03, 0x03)           // version
++	b = append(b, make([]byte, 32)...)  // random
++	b = append(b, 0x00)                 // session id length
++	b = append(b, 0x00, 0x02, 0x13, 0x01) // cipher suites
++	b = append(b, 0x01, 0x00)           // compression methods
++	b = append(b, byte(len(ext)>>8), byte(len(ext)))
++	b = append(b, ext...)
++	return b
++}
++
++// fakeConn / addrConn only exist to give a connection controllable addresses.
++type fakeConn struct {
++	net.Conn
++	remote, local net.Addr
++}
++
++func (f *fakeConn) RemoteAddr() net.Addr { return f.remote }
++func (f *fakeConn) LocalAddr() net.Addr  { return f.local }
++
++type addrConn struct {
++	net.Conn
++	remote, local net.Addr
++}
++
++func (a *addrConn) RemoteAddr() net.Addr { return a.remote }
++func (a *addrConn) LocalAddr() net.Addr  { return a.local }
+-- 
+2.43.0
+

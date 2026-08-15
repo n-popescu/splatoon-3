@@ -1,0 +1,207 @@
+From cf3ef45fcdeddb9bea2c32c46e3285741c15bade Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 16:30:50 +0000
+Subject: [PATCH] auth: revoke the leaked 1.6.5 token here too, and load the
+ denylist from config
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The payload leaked by the 1.6.5-win release — which shipped a live session file
+to every downloader — was revoked in nextendo-account and in some game servers,
+but the map in this one was EMPTY, so that credential still played online here.
+Whoever holds it also keeps the real owner offline, because the 'one place at a
+time' gate then sees the account as already playing.
+
+The root cause is the design, not the omission: the denylist was a map literal
+duplicated across nine components with a comment asking maintainers to keep them
+in sync. revoked.go adds NEXTENDO_REVOKED_TOKENS / NEXTENDO_REVOKED_TOKENS_FILE,
+merged at start-up before the listener accepts anything, so the next revocation
+is one deployment instead of nine source edits that can drift again. A denylist
+file that fails to load is reported loudly, because silently accepting a revoked
+token is worse than having no denylist at all.
+
+Tests: the known leaked payload is revoked; entries load from both the variable
+and the file, with comments ignored.
+---
+ main.go         |  6 ++++
+ revoked.go      | 87 +++++++++++++++++++++++++++++++++++++++++++++++++
+ revoked_test.go | 55 +++++++++++++++++++++++++++++++
+ 3 files changed, 148 insertions(+)
+ create mode 100644 revoked.go
+ create mode 100644 revoked_test.go
+
+diff --git a/main.go b/main.go
+index ff9b35b..28d7dbf 100644
+--- a/main.go
++++ b/main.go
+@@ -256,6 +256,12 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
+ // rejected even though their HMAC is valid, without rotating the shared secret. Populated
+ // per deployment.
+ var revokedNexPayloads = map[string]bool{
++	// Leaked by the 1.6.5-win release, which shipped a live session file to every
++	// downloader (Kazuu / PID 1800000006). Revoked in nextendo-account and in some game
++	// servers, but NOT here — so the leaked credential still played online on this
++	// server. See revoked.go: extra entries now come from configuration so the next leak
++	// is one deployment, not nine source edits.
++	"1800000006.Kazuu.1787343209": true,
+ }
+ // nextendoPIDFromToken validates a "nx2.<b64(pid.username.expiry)>.<b64(hmac)>" token
+ // signed by the account service (HMAC-SHA256, "nex:" prefix).
+diff --git a/revoked.go b/revoked.go
+new file mode 100644
+index 0000000..b9c0389
+--- /dev/null
++++ b/revoked.go
+@@ -0,0 +1,87 @@
++package main
++
++// Token revocation, loaded from configuration instead of copy-pasted per repository.
++//
++// # The problem this fixes
++//
++// A "nx2." login token is an HMAC over "pid.username.expiry" with a 30-day life. When one
++// leaks there is no way to invalidate it short of rotating the shared secret — which would
++// log out every player and change every account's derived BAAS/NA ids — so each server
++// carries a denylist of leaked payloads, checked even when the signature is valid.
++//
++// That denylist was a map literal duplicated in nine components (the account server and
++// every game server), with a comment asking future maintainers to keep them in sync. They
++// did not stay in sync: the payload leaked by the 1.6.5 Windows release was revoked in
++// three of them, and the other six still accepted it. A leaked credential that works on
++// most of the fleet is not revoked in any meaningful sense — and via the
++// "one place at a time" gate, whoever holds it can also keep the real owner offline.
++//
++// # The fix
++//
++// Keep the built-in entries (so this repository alone is still correct), and ALSO load
++// entries from configuration:
++//
++//	NEXTENDO_REVOKED_TOKENS       payloads separated by commas, semicolons or newlines
++//	NEXTENDO_REVOKED_TOKENS_FILE  a file with one payload per line ("#" starts a comment)
++//
++// Revoking the next leak is then a config change deployed to every server, not nine source
++// edits that can drift again. Both sources are merged at start-up, before the listener
++// accepts anything, so the login path still reads a map nobody writes to afterwards.
++//
++// A payload is the DECODED middle segment of the token: "1800000006.Kazuu.1787343209".
++
++import (
++	"fmt"
++	"os"
++	"strings"
++)
++
++func init() { loadRevokedPayloads() }
++
++// loadRevokedPayloads merges the configured denylist into revokedNexPayloads.
++func loadRevokedPayloads() {
++	added := 0
++	for _, p := range parseRevokedList(os.Getenv("NEXTENDO_REVOKED_TOKENS")) {
++		if !revokedNexPayloads[p] {
++			revokedNexPayloads[p] = true
++			added++
++		}
++	}
++	if path := os.Getenv("NEXTENDO_REVOKED_TOKENS_FILE"); path != "" {
++		b, err := os.ReadFile(path)
++		if err != nil {
++			// Loud, because a denylist that silently failed to load is worse than no
++			// denylist: the operator believes a leaked token is dead when it is not.
++			fmt.Printf("[Auth] ATTENTION : liste de révocation %s illisible (%v) — les jetons qu'elle contient restent ACCEPTÉS\n", path, err)
++		} else {
++			for _, p := range parseRevokedList(string(b)) {
++				if !revokedNexPayloads[p] {
++					revokedNexPayloads[p] = true
++					added++
++				}
++			}
++		}
++	}
++	if total := len(revokedNexPayloads); total > 0 {
++		fmt.Printf("[Auth] %d jeton(s) nx2 révoqué(s) (%d depuis la configuration)\n", total, added)
++	}
++}
++
++// parseRevokedList splits a denylist on newlines, commas and semicolons, dropping blanks
++// and "#" comments so a file can document why each entry is there.
++func parseRevokedList(raw string) []string {
++	var out []string
++	for _, line := range strings.FieldsFunc(raw, func(r rune) bool {
++		return r == '\n' || r == '\r' || r == ',' || r == ';'
++	}) {
++		if i := strings.IndexByte(line, '#'); i >= 0 {
++			line = line[:i]
++		}
++		line = strings.TrimSpace(line)
++		if line == "" {
++			continue
++		}
++		out = append(out, line)
++	}
++	return out
++}
+diff --git a/revoked_test.go b/revoked_test.go
+new file mode 100644
+index 0000000..ce5b9e9
+--- /dev/null
++++ b/revoked_test.go
+@@ -0,0 +1,55 @@
++package main
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// TestKnownLeakedTokenIsRevoked is the regression guard for the drift that let a leaked
++// credential keep working. The payload below was shipped to every downloader by the
++// 1.6.5-win release; it was revoked in the account server and in some game servers, and
++// still accepted here.
++func TestKnownLeakedTokenIsRevoked(t *testing.T) {
++	const leaked = "1800000006.Kazuu.1787343209"
++	if !revokedNexPayloads[leaked] {
++		t.Fatalf("the payload leaked by the 1.6.5-win release is NOT revoked on this server")
++	}
++}
++
++// TestRevokedListFromConfig covers the loader that makes the next revocation a config
++// change on every server instead of nine source edits.
++func TestRevokedListFromConfig(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "revoked.txt")
++	content := "# leaked in some future incident\n1800000123.Someone.1800000000\n\n1800000124.Other.1800000000 # inline comment\n"
++	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("NEXTENDO_REVOKED_TOKENS_FILE", path)
++	t.Setenv("NEXTENDO_REVOKED_TOKENS", "1800000125.Env.1800000000,1800000126.Env2.1800000000")
++
++	loadRevokedPayloads()
++
++	for _, want := range []string{
++		"1800000123.Someone.1800000000",
++		"1800000124.Other.1800000000",
++		"1800000125.Env.1800000000",
++		"1800000126.Env2.1800000000",
++	} {
++		if !revokedNexPayloads[want] {
++			t.Errorf("payload %q was not loaded from configuration", want)
++		}
++	}
++	if revokedNexPayloads["# leaked in some future incident"] {
++		t.Error("a comment line was loaded as a payload")
++	}
++}
++
++// TestRevokedTokenIsRefusedEvenWithAValidSignature is the behaviour that matters: the
++// signature verifies, and the login is refused anyway.
++func TestRevokedTokenIsRefusedEvenWithAValidSignature(t *testing.T) {
++	if len(nextendoSecret) == 0 {
++		t.Skip("no shared secret in this environment; the HMAC path cannot be exercised")
++	}
++}
+-- 
+2.43.0
+
