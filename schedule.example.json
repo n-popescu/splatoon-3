@@ -1,0 +1,58 @@
+{
+  "_comment": [
+    "Splatoon 3 rotation. See docs/SCHEDULE.md.",
+    "The stage and rule NUMBERS below are placeholders: they are game data, they cannot be derived",
+    "from the protocol, and they must be replaced with the real ones for the game to show the right",
+    "stages. Bump schedule_set_id whenever you change anything here, or clients keep their cached copy."
+  ],
+
+  "schedule_set_id": "nextendo-1",
+  "target": "default",
+  "rotation_minutes": 120,
+  "slot_count": 12,
+
+  "regular": [
+    { "stages": [1, 2] },
+    { "stages": [3, 4] },
+    { "stages": [5, 6] }
+  ],
+
+  "bankara": [
+    { "modes": [ { "rule": 1, "stages": [7, 8] }, { "rule": 2, "stages": [9, 10] } ] },
+    { "modes": [ { "rule": 3, "stages": [1, 3] }, { "rule": 4, "stages": [5, 7] } ] }
+  ],
+
+  "x": [
+    { "rule": 1, "stages": [2, 4] },
+    { "rule": 2, "stages": [6, 8] }
+  ],
+
+  "league": [],
+
+  "coop": [
+    {
+      "stage": 1,
+      "boss": "",
+      "main_weapons": [0, 1, 2, 3],
+      "kuma_weapon": 0,
+      "reward_type": "",
+      "reward_gear_id": 0
+    },
+    {
+      "stage": 2,
+      "boss": "",
+      "main_weapons": [4, 5, 6, 7],
+      "kuma_weapon": 0,
+      "reward_type": "",
+      "reward_gear_id": 0
+    }
+  ],
+
+  "season": {
+    "id": "current",
+    "start": "2026-06-01T00:00:00Z",
+    "end": "2026-09-01T00:00:00Z"
+  },
+
+  "fest": null
+}
