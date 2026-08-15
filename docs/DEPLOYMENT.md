@@ -3,6 +3,11 @@
 Everything below is a placeholder you replace. No real address or secret appears anywhere in this
 repository.
 
+> Connecting a **retail console** rather than the emulator? Read
+> [SETUP-HARDWARE.md](SETUP-HARDWARE.md) instead — it is the same material in procedure form, plus the
+> two settings that differ on hardware (`NEXTENDO_REQUIRE_SIGNED_TOKEN` must stay off, and the
+> `sni-router` NPLN route is required).
+
 > You must supply your own legally-dumped game, keys and system files. This project ships none of
 > Nintendo's code, keys or data.
 
@@ -29,7 +34,11 @@ That is the only host this server needs. Splatoon 3 also talks to the account la
 redirects — `Prelude-Nro` writes a hosts file with `*.nintendo.*` wildcards, so nothing extra is
 required on a console.
 
-If you front `:443` with `sni-router`, add the tenant host to its map so it forwards to this process.
+If you front `:443` with `sni-router`, it needs the NPLN route from
+[`audit/patches/08-sni-router-npln-route.patch`](../audit/patches/08-sni-router-npln-route.patch);
+without it the tenant host falls through to `BACKEND_DEFAULT`, a NEX auth server, and the connection
+dies silently after a successful TLS handshake. With the patch applied, set
+`BACKEND_NPLN=<this host>:443`.
 
 ## Ports
 
@@ -121,8 +130,8 @@ services:
     image: nextendo/sni-router
     ports: ["443:443"]
     environment:
-      # add the Splatoon 3 tenant host next to the NEX auth hosts
-      NPLN_S3: "splatoon3:443"
+      # requires audit/patches/08-sni-router-npln-route.patch
+      BACKEND_NPLN: "splatoon3:443"
 
   splatoon3:
     build: .
@@ -186,4 +195,5 @@ without it — this server pushes to `/internal/presence-batch`.)
 - The data directory is not world-readable (`npln_signing_key.pem` signs every identity).
 - Secrets come from the environment or files, never from the repository.
 - `NEXTENDO_REQUIRE_SIGNED_TOKEN=1` if your deployment is emulator-only — it makes identity
-  cryptographic rather than directory-based.
+  cryptographic rather than directory-based. Leave it **off** if any retail console connects: a retail
+  console cannot produce the `nnex` claim, so `1` rejects it (see [SETUP-HARDWARE.md](SETUP-HARDWARE.md)).

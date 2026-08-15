@@ -271,3 +271,8 @@ The NPLN friend model is not the Home Menu one, and two details are easy to get 
    (`status` 2) while `b` is playing.
 6. Have one console leave online play: the other should see them go offline within seconds (the
    immediate publish), not after 90 s.
+
+One console is not enough to prove anything here: with a single console the buggy fallback returns the
+right account by accident. The full hardware procedure, including the `/internal/whoami` and
+`/internal/bind` calls and how to recover a console already poisoned by the old fallback, is in
+[SETUP-HARDWARE.md](SETUP-HARDWARE.md#part-e--the-friend-code-bug-on-hardware).

@@ -95,6 +95,10 @@ go build ./cmd/splatoon-3
 Everything is configured through the environment; no address, key or secret is baked into the source.
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for DNS, TLS, STUN/TURN and a compose file.
 
+**Connecting a real console?** [docs/SETUP-HARDWARE.md](docs/SETUP-HARDWARE.md) is the step-by-step
+procedure for a retail Switch on Atmosphère + Prelude, including the two settings that differ from the
+emulator and a symptom-to-cause table.
+
 ## Documentation
 
 | Document | What is in it |
@@ -102,6 +106,7 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for DNS, TLS, STUN/TURN and a compo
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the pieces fit, and what happens from boot to match |
 | [docs/NPLN-PROTOCOL.md](docs/NPLN-PROTOCOL.md) | the protocol itself: metadata, tokens, resource names, errors |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | running it: DNS, TLS, ICE, environment, compose |
+| [docs/SETUP-HARDWARE.md](docs/SETUP-HARDWARE.md) | connecting a **real Switch**: server, router, console, verification, troubleshooting |
 | [docs/MATCHMAKING.md](docs/MATCHMAKING.md) | how players end up in the same room, and what to tune |
 | [docs/SCHEDULE.md](docs/SCHEDULE.md) | the rotation file |
 | [docs/FRIENDS.md](docs/FRIENDS.md) | the Switch friends system: root causes and fixes |

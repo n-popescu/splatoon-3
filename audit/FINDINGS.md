@@ -575,6 +575,32 @@ Recording these so nobody spends the time again.
 
 ---
 
+## F19 — `sni-router` had no route for NPLN, so Splatoon 3 could never be reached on `:443`
+
+**Where:** `sni-router/main.go`, the SNI switch in `handle`.
+
+**What.** The router matched the NEX secure-server hosts (`g2b309e01`, `g23380901`, `g25c08801`),
+`ndas.srv.nintendo.net` and `dragons.nintendo.net`, and sent everything else to `BACKEND_DEFAULT` —
+which is MK8's authentication server by default. Splatoon 3 connects to
+`t-dce9377b-lp1.lp1.t.npln.srv.nintendo.net`, so it landed on `BACKEND_DEFAULT`.
+
+**Why it matters.** Prelude's hosts file already sends the NPLN host to the Nextendo IP: the wildcard
+`*srv.nintendo.net` line covers it, and nothing after it overrides it. So a console *does* reach the
+router, and the router hands the connection to a NEX server that completes the TLS handshake and then
+speaks nothing the client understands. The failure is maximally confusing: DNS is right, the port is
+open, TLS succeeds, and the game still fails — with no log line on either side saying why, because
+the NEX server never gets a message it recognises and the router considers the connection normal.
+
+Worth stressing that this was **latent**: it only becomes reachable now that there is an NPLN backend
+to route to. It is in the audit because the fix belongs with the other router work, and because
+anyone bringing the Splatoon 3 server up on a shared `:443` hits it first.
+
+**Fixed:** `patches/08` adds `BACKEND_NPLN`, matched on `npln.srv.nintendo.net` and placed so the
+NEX rules keep precedence. Unset, behaviour is exactly as before. A test asserts the tenant host
+matches the new rule and none of the NEX rules.
+
+---
+
 ## Round-two patch index
 
 | Patch | Repository | Fixes |
@@ -582,5 +608,7 @@ Recording these so nobody spends the time again.
 | `05-nextendo-nex-reassembly-limit-panic-containment.patch` | `nextendo-nex` | F15, F16, F17 |
 | `06-nx-dauth-bound-request-bodies.patch` | `nx-dauth` | F18 |
 | `07-mario-strikers-atomic-club-store.patch` | `mario-strikers` | F18 |
+| `08-sni-router-npln-route.patch` | `sni-router` | F19 |
 
-`05` applies on top of `01` (both touch `nextendo-nex`); apply them in order.
+`05` applies on top of `01` (both touch `nextendo-nex`); apply them in order. `08` applies on top of
+`03` (both touch `sni-router`); same.

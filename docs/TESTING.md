@@ -3,6 +3,10 @@
 Nobody has put a console in front of this server yet. This is the order to do it in, and how to read
 what comes back.
 
+For a **retail console** specifically — what to install, what to configure differently from the
+emulator, and a symptom-to-cause table — follow [SETUP-HARDWARE.md](SETUP-HARDWARE.md). This document
+is the protocol-level view that applies to any client.
+
 ## 0. Before a console
 
 ```sh

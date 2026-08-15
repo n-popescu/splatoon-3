@@ -1,8 +1,8 @@
 # Nextendo Network — cross-repository audit
 
 An audit of every repository in the [NextendoNetwork](https://github.com/orgs/NextendoNetwork/repositories)
-organisation, done while building the Splatoon 3 server. Two passes so far: **18 findings**, of which
-**12 are fixed** by the patches in [`patches/`](patches), the rest documented with a recommendation.
+organisation, done while building the Splatoon 3 server. Two passes so far: **19 findings**, of which
+**13 are fixed** by the patches in [`patches/`](patches), the rest documented with a recommendation.
 
 Two of the fixes are for defects that were actively breaking gameplay and identity across the whole
 fleet:
@@ -48,6 +48,7 @@ it belongs — nothing here depends on the location.
 | F16 | Med-High | `nextendo-nex` | No panic containment: one malformed message killed the process, i.e. every player | **fixed** |
 | F17 | Low-Med | `nextendo-nex` | List pre-allocation amplifies a request into a much larger allocation | **fixed** |
 | F18 | Low | `nx-dauth`, `mario-strikers` | Unbounded request bodies; non-atomic club store (F12, now patched) | **fixed** |
+| F19 | Medium | `sni-router` | No route for `*.npln.srv.nintendo.net`: Splatoon 3 fell through to a NEX auth server | **fixed** |
 
 ## Applying the patches
 
@@ -60,9 +61,13 @@ git am /path/to/audit/patches/NN-<repo>-....patch    # -3 if your checkout has m
 go build ./... && go test ./...
 ```
 
-Order does not matter — each patch touches one repository and they are independent. The suggested
-sequence by impact is F1 (`02`), F3 (`11`–`15`), F2 (`10`, `16`–`18`), F4 (`04`), then the core (`01`)
-and the router (`03`).
+Order does not matter, except where two patches touch the same repository (`05` after `01`, `08`
+after `03`). The suggested sequence by impact is F1 (`02`), F3 (`11`–`15`), F2 (`10`, `16`–`18`),
+F4 (`04`), then the core (`01`, `05`) and the router (`03`, `08`).
+
+If you are bringing up the Splatoon 3 server on real hardware, `08` is the one you need first —
+without it the console reaches the router and gets handed to a NEX server. See
+[docs/SETUP-HARDWARE.md](../docs/SETUP-HARDWARE.md).
 
 | Patch | Repository |
 | --- | --- |
@@ -73,6 +78,7 @@ and the router (`03`).
 | `05-nextendo-nex-reassembly-limit-panic-containment.patch` | `nextendo-nex` (apply after `01`) |
 | `06-nx-dauth-bound-request-bodies.patch` | `nx-dauth` |
 | `07-mario-strikers-atomic-club-store.patch` | `mario-strikers` |
+| `08-sni-router-npln-route.patch` | `sni-router` (apply after `03`) |
 | `10-splatoon-2-revoke-leaked-token.patch` | `splatoon-2` |
 | `11-mario-kart-8-deluxe-presence-and-revocation-loader.patch` | `mario-kart-8-deluxe` |
 | `12-super-smash-bros-ultimate-presence-and-revocation.patch` | `super-smash-bros-ultimate` |
@@ -96,6 +102,7 @@ The `nextendo-account` friends/identity fix is a separate series in
 | `SCSI_URL_KEY` | `nx-scsi` | HMAC key for blob URLs (generated into the data dir if unset) |
 | `SCSI_MAX_BLOB_BYTES` | `nx-scsi` | Upload cap, default 64 MiB |
 | `SCSI_ALLOW_UNSIGNED_BLOBS=1` | `nx-scsi` | Temporary: keep accepting old, unsigned URLs while consoles migrate |
+| `BACKEND_NPLN` | `sni-router` | Where to send `*.npln.srv.nintendo.net` (the Splatoon 3 server). Unset ⇒ previous behaviour |
 
 ## How it was audited
 
