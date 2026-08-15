@@ -1,0 +1,311 @@
+From 8d46e367b3cec412c6009ed486f491a971551016 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 16:43:36 +0000
+Subject: [PATCH] core: bound fragment reassembly, contain handler panics, cap
+ list pre-allocation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three robustness defects on the path that parses whatever a client sends. All
+three have the same shape: the blast radius of one bad message is the whole
+process, i.e. every player in every lobby.
+
+1. UNBOUNDED REASSEMBLY (remote memory exhaustion). A message is only dispatched
+   when a fragment arrives with FragmentID 0, so a peer that keeps sending
+   fragments and never terminates the message grew fragBuf without limit. The
+   per-packet payload is bounded by the 16-bit length field, but the NUMBER of
+   fragments was not: a few thousand packets is a gigabyte, and the process dying
+   drops everybody. Now bounded (1 MiB, NEXTENDO_MAX_MESSAGE_BYTES) — far above
+   the largest real message (SSBU's DataStore init is ~16 KB) — and the offending
+   connection is closed rather than handed a truncated message.
+
+2. NO PANIC CONTAINMENT. There was no recover() anywhere in the package. Every
+   handler parses bytes a client chose, and a game server registers a dozen of
+   them written against a protocol that is still being reverse-engineered; one
+   out-of-range index took the PROCESS down. The panic is now caught per request,
+   logged with its stack, and answered with an RMC error: the caller learns its
+   request failed and everybody else keeps playing.
+
+3. LIST PRE-ALLOCATION AMPLIFICATION. ReadList/ReadMap check the announced count
+   against the remaining bytes, but a large legitimate message can still announce
+   millions of elements, and make([]T, 0, n) then allocates n * sizeof(T) — tens
+   of times the size of the message that asked for it. Pre-allocation is now
+   capped at 1024 and the loop stops at the first element that fails to decode,
+   instead of appending n zero values.
+
+Tests: the reassembly buffer never exceeds the limit and the connection is
+dropped; a panicking handler answers an error and the SAME connection keeps
+working afterwards; an over-announced list is rejected, and a partially-backed
+one stops at the truncation. Verified with -race.
+---
+ endpoint.go        |  56 +++++++++++++++++++++-
+ robustness_test.go | 114 +++++++++++++++++++++++++++++++++++++++++++++
+ stream.go          |  26 ++++++++++-
+ 3 files changed, 193 insertions(+), 3 deletions(-)
+ create mode 100644 robustness_test.go
+
+diff --git a/endpoint.go b/endpoint.go
+index f1fc4e1..24bad51 100644
+--- a/endpoint.go
++++ b/endpoint.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/binary"
+ 	"fmt"
+ 	"os"
++	"runtime/debug"
+ 	"strconv"
+ 	"sync"
+ 	"sync/atomic"
+@@ -29,6 +30,19 @@ var fragmentPacing = func() time.Duration {
+ 	return time.Duration(ms) * time.Millisecond
+ }()
+ 
++// maxReassembledMessage bounds ONE reassembled RMC message (see processData).
++// Env NEXTENDO_MAX_MESSAGE_BYTES overrides it; values below 64 KiB are ignored so
++// a typo cannot break a legitimate large payload.
++var maxReassembledMessage = func() int {
++	limit := 1 << 20
++	if v := os.Getenv("NEXTENDO_MAX_MESSAGE_BYTES"); v != "" {
++		if n, err := strconv.Atoi(v); err == nil && n >= 64<<10 {
++			limit = n
++		}
++	}
++	return limit
++}()
++
+ // retransmitInterval is how often unacknowledged reliable packets are re-sent. It is a
+ // slow last-resort backstop: a fast interval re-sends fragments the console is still
+ // reassembling, and the duplicates corrupt/reset its reassembly.
+@@ -558,6 +572,25 @@ func (c *Connection) processData(p *Packet) {
+ 		c.sendAck(p)
+ 	}
+ 	// Reassemble reliable fragments in arrival order (WebSocket is in-order).
++	//
++	// BOUNDED. A message is only dispatched when a fragment arrives with
++	// FragmentID 0, so a peer that keeps sending fragments and never terminates the
++	// message grows this buffer without limit — a few thousand packets is a
++	// gigabyte, and the process dying takes every player in every lobby with it,
++	// not just the one connection. Nothing else caps it: the per-packet payload is
++	// bounded by the 16-bit length field, but the NUMBER of fragments was not.
++	//
++	// The limit is generous next to the largest real message (SSBU's DataStore init
++	// is ~16 KB, and client requests are a few KB), so reaching it means the peer is
++	// broken or hostile: drop the buffer and close the connection rather than
++	// silently truncating, which would hand a half-message to a handler.
++	if len(c.fragBuf)+len(p.Payload) > maxReassembledMessage {
++		fmt.Printf("[PRUDP] %s pid=%d: reassembled message exceeds %d bytes (%d + %d) — dropping the connection\n",
++			c.RemoteAddr, c.PID, maxReassembledMessage, len(c.fragBuf), len(p.Payload))
++		c.fragBuf = nil
++		c.close()
++		return
++	}
+ 	c.fragBuf = append(c.fragBuf, p.Payload...)
+ 	if p.FragmentID == 0 {
+ 		full := c.fragBuf
+@@ -588,11 +621,32 @@ func (c *Connection) dispatchRMC(payload []byte) {
+ 		c.SendRMC(NewRMCError(c.Settings, req.Protocol, req.CallID, ResultCoreNotImplemented))
+ 		return
+ 	}
+-	if resp := handler(c, req); resp != nil {
++	if resp := c.callHandler(handler, req); resp != nil {
+ 		c.SendRMC(resp)
+ 	}
+ }
+ 
++// callHandler runs an RMC handler with a recover barrier.
++//
++// Every handler parses bytes a client chose, and a game server registers a dozen
++// of them written against a protocol that is still being reverse-engineered. A
++// single out-of-range index in any one of them used to take the PROCESS down —
++// which means every player in every lobby is disconnected because one console
++// sent one malformed message, and the only trace is a stack trace in the log.
++//
++// The blast radius should be the request. The caller gets an error, the panic is
++// logged with its stack so it can be fixed, and everybody else keeps playing.
++func (c *Connection) callHandler(handler RMCHandler, req *RMCMessage) (resp *RMCMessage) {
++	defer func() {
++		if r := recover(); r != nil {
++			fmt.Printf("[PRUDP] PANIC in handler proto=%#x method=%d pid=%d addr=%s: %v\n%s\n",
++				req.Protocol, req.Method, c.PID, c.RemoteAddr, r, debug.Stack())
++			resp = NewRMCError(c.Settings, req.Protocol, req.CallID, ResultCoreUnknown)
++		}
++	}()
++	return handler(c, req)
++}
++
+ // SendRMC serializes and sends an RMC message as reliable DATA (fragmenting as
+ // needed). Safe to call from any goroutine (used for server→client pushes too).
+ func (c *Connection) SendRMC(msg *RMCMessage) {
+diff --git a/robustness_test.go b/robustness_test.go
+new file mode 100644
+index 0000000..ec74d7f
+--- /dev/null
++++ b/robustness_test.go
+@@ -0,0 +1,114 @@
++package nex
++
++import (
++	"strings"
++	"sync"
++	"testing"
++)
++
++// TestReassemblyIsBounded is the regression guard for a remote memory-exhaustion DoS.
++//
++// A message is only dispatched when a fragment arrives with FragmentID 0, so a peer that
++// keeps sending fragments and never terminates the message grew the reassembly buffer
++// without limit. A few thousand packets is a gigabyte, and the process dying takes every
++// player in every lobby with it — not just the one connection.
++func TestReassemblyIsBounded(t *testing.T) {
++	e := NewEndpoint(NewSwitchSettings("00000000", 40000))
++	closed := false
++	e.OnDisconnect = func(*Connection) { closed = true }
++	c := NewConnection(e, "203.0.113.9:52345", func([]byte) {})
++	c.state.Store(stateConnected)
++
++	// 4 KB per fragment, and never a terminating FragmentID 0.
++	chunk := make([]byte, 4096)
++	for i := 0; i < 10000; i++ {
++		c.processData(&Packet{Type: PacketDATA, FragmentID: 1, Payload: chunk})
++		if len(c.fragBuf) > maxReassembledMessage {
++			t.Fatalf("reassembly buffer grew past the limit: %d > %d", len(c.fragBuf), maxReassembledMessage)
++		}
++		if closed {
++			break
++		}
++	}
++	if !closed {
++		t.Fatal("the connection was never dropped; the buffer would keep growing")
++	}
++	if len(c.fragBuf) != 0 {
++		t.Errorf("the buffer was not released on close: %d bytes", len(c.fragBuf))
++	}
++}
++
++// TestHandlerPanicDoesNotKillTheProcess: every handler parses bytes a client chose, and a
++// game server registers a dozen of them written against a protocol still being
++// reverse-engineered. One out-of-range index used to take the PROCESS down, disconnecting
++// every player in every lobby.
++func TestHandlerPanicDoesNotKillTheProcess(t *testing.T) {
++	s := NewSwitchSettings("00000000", 40000)
++	e := NewEndpoint(s)
++	e.Register(0x6D, func(conn *Connection, req *RMCMessage) *RMCMessage {
++		var empty []byte
++		_ = empty[7] // the shape of a real bug: an unchecked index into a client payload
++		return nil
++	})
++
++	var sent [][]byte
++	var mu sync.Mutex
++	c := NewConnection(e, "203.0.113.9:52345", func(b []byte) {
++		mu.Lock()
++		sent = append(sent, b)
++		mu.Unlock()
++	})
++	c.state.Store(stateConnected)
++
++	// Must not panic, and must answer.
++	c.dispatchRMC(NewRMCRequest(s, 0x6D, 1, 99, []byte{0x01}).Encode())
++
++	mu.Lock()
++	defer mu.Unlock()
++	if len(sent) == 0 {
++		t.Fatal("the panicking handler produced no response; the caller would hang")
++	}
++	// A following request on the SAME connection must still work: the barrier is per
++	// request, not per connection.
++	e.Register(0x6E, func(conn *Connection, req *RMCMessage) *RMCMessage {
++		return NewRMCSuccess(conn.Settings, 0x6E, req.Method, req.CallID, []byte{0x42})
++	})
++	before := len(sent)
++	mu.Unlock()
++	c.dispatchRMC(NewRMCRequest(s, 0x6E, 1, 100, nil).Encode())
++	mu.Lock()
++	if len(sent) <= before {
++		t.Fatal("the connection stopped working after a handler panicked")
++	}
++}
++
++// TestListLengthCannotAmplify: ReadList checks the count against the remaining bytes, but a
++// large legitimate message can still ask for millions of elements, and pre-allocating
++// n * sizeof(T) turns a 4 MB request into a much larger allocation.
++func TestListLengthCannotAmplify(t *testing.T) {
++	s := NewSwitchSettings("00000000", 40000)
++
++	// A count of 1M with only a few bytes of payload: rejected outright.
++	out := NewStreamOut(s)
++	out.U32(1 << 20)
++	out.Write([]byte{1, 2, 3})
++	in := NewStreamIn(out.Bytes(), s)
++	list := ReadList(in, func(i *StreamIn) uint64 { return i.U64() })
++	if in.Err() == nil {
++		t.Error("a count larger than the remaining bytes was accepted")
++	}
++	if len(list) != 0 {
++		t.Errorf("a rejected list returned %d elements", len(list))
++	}
++
++	// A count that passes the remaining-bytes check but is not backed by real elements:
++	// the loop must stop at the first failed element, not append zero values n times.
++	body := NewStreamOut(s)
++	body.U32(200)                                  // 200 elements announced
++	body.Write([]byte(strings.Repeat("\x00", 400))) // room for 50 u64s
++	in2 := NewStreamIn(body.Bytes(), s)
++	got := ReadList(in2, func(i *StreamIn) uint64 { return i.U64() })
++	if len(got) > 51 {
++		t.Errorf("read %d elements from a body that can only hold 50", len(got))
++	}
++}
+diff --git a/stream.go b/stream.go
+index 5d5599a..d82f7d1 100644
+--- a/stream.go
++++ b/stream.go
+@@ -243,9 +243,24 @@ func ReadList[T any](s *StreamIn, f func(*StreamIn) T) []T {
+ 		}
+ 		return nil
+ 	}
+-	out := make([]T, 0, n)
++	// Pre-allocate in a bounded step. n is only checked against the REMAINING
++	// bytes, so a 4 MB message can legitimately ask for 4 million elements, and
++	// make([]T, 0, n) then allocates n * sizeof(T) — up to tens of times the size
++	// of the message that asked for it. Growing from a cap costs a few copies and
++	// removes the amplification.
++	const preallocCap = 1024
++	prealloc := n
++	if prealloc > preallocCap {
++		prealloc = preallocCap
++	}
++	out := make([]T, 0, prealloc)
+ 	for i := 0; i < n; i++ {
+ 		out = append(out, f(s))
++		// A malformed element stops the list: without this the loop keeps calling f
++		// on an exhausted stream, appending zero values n times.
++		if s.err != nil {
++			break
++		}
+ 	}
+ 	return out
+ }
+@@ -259,10 +274,17 @@ func ReadMap[K comparable, V any](s *StreamIn, kf func(*StreamIn) K, vf func(*St
+ 		}
+ 		return nil
+ 	}
+-	m := make(map[K]V, n)
++	prealloc := n
++	if prealloc > 1024 {
++		prealloc = 1024
++	}
++	m := make(map[K]V, prealloc)
+ 	for i := 0; i < n; i++ {
+ 		k := kf(s)
+ 		m[k] = vf(s)
++		if s.err != nil {
++			break
++		}
+ 	}
+ 	return m
+ }
+-- 
+2.43.0
+

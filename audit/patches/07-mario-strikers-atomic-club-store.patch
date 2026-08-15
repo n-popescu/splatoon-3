@@ -1,0 +1,47 @@
+From 475ffc077a7f18c53d9122c5536de10467b27b98 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 16:43:37 +0000
+Subject: [PATCH] clubs: write the club store atomically
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+os.WriteFile truncates and then writes, so a crash or a full disk in that window
+left a TRUNCATED club store — persistent player state, silently destroyed, and
+only discovered the next time it is read. Temp file plus rename means a reader
+sees either the old file or the new one.
+
+nextendo-account writes every one of its stores this way (sessions, bans,
+history, accounts); this was the exception. The file mode also drops from 0644 to
+0600: it is player data.
+---
+ strikers_club.go | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/strikers_club.go b/strikers_club.go
+index a26f9a7..d7d5cf1 100644
+--- a/strikers_club.go
++++ b/strikers_club.go
+@@ -201,7 +201,18 @@ func saveClubs() {
+ 	}
+ 	clubStore.Unlock()
+ 	if data, err := json.Marshal(saved); err == nil {
+-		_ = os.WriteFile(clubStorePath(), data, 0o644)
++		// Atomic: os.WriteFile truncates and then writes, so a crash or a full disk in
++		// that window left a TRUNCATED club store — persistent player state, silently
++		// destroyed, and only noticed the next time it is read. Temp file + rename means a
++		// reader sees the old file or the new one. (nextendo-account writes every one of its
++		// stores this way; this one was the exception.)
++		tmp := clubStorePath() + ".tmp"
++		if err := os.WriteFile(tmp, data, 0o600); err != nil {
++			fmt.Printf("[Clubs] cannot write %s: %v\n", tmp, err)
++		} else if err := os.Rename(tmp, clubStorePath()); err != nil {
++			fmt.Printf("[Clubs] cannot replace %s: %v\n", clubStorePath(), err)
++			_ = os.Remove(tmp)
++		}
+ 	}
+ }
+ 
+-- 
+2.43.0
+
