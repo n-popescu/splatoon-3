@@ -79,7 +79,8 @@ go build ./... && go test ./...    # 78 tests, all offline
 
 | Document | What is in it |
 | --- | --- |
-| [docs/INTEGRATION.md](docs/INTEGRATION.md) | **read first**: how this fits the fleet, what differs and why |
+| [docs/TESTING-GUIDE.md](docs/TESTING-GUIDE.md) | **step-by-step testing guide, written for a non-programmer** — start here if you are verifying this |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | **read first if you maintain the project**: how this fits the fleet, what differs and why |
 | [docs/SETUP-HARDWARE.md](docs/SETUP-HARDWARE.md) | connecting a real Switch, step by step |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the pieces fit, and what happens from boot to match |
 | [docs/NPLN-PROTOCOL.md](docs/NPLN-PROTOCOL.md) | the protocol: metadata, tokens, resource names, errors |

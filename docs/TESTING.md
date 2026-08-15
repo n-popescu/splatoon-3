@@ -3,6 +3,9 @@
 Nobody has put a console in front of this server yet. This is the order to do it in, and how to read
 what comes back.
 
+If you are not a developer, read [TESTING-GUIDE.md](TESTING-GUIDE.md) instead: same ground, every
+command spelled out, with the expected output for each one.
+
 For a **retail console** specifically — what to install, what to configure differently from the
 emulator, and a symptom-to-cause table — follow [SETUP-HARDWARE.md](SETUP-HARDWARE.md). This document
 is the protocol-level view that applies to any client.
