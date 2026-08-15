@@ -6,7 +6,7 @@
 GO      ?= go
 BINARY  ?= splatoon-3
 
-.PHONY: build test vet run generate tidy clean
+.PHONY: build test vet run smoke generate tidy clean
 
 build:
 	$(GO) build -o $(BINARY) ./cmd/splatoon-3
@@ -21,6 +21,11 @@ vet:
 # want while bringing the title up. See docs/TESTING.md.
 run: build
 	NPLN_DISABLE_TLS=1 NPLN_LISTEN_ADDR=127.0.0.1:50051 NPLN_LOG_BODIES=1 ./$(BINARY)
+
+# Talk to a running server over real gRPC and assert the invariants that matter.
+# See docs/TESTING.md.
+smoke:
+	$(GO) run ./cmd/npln-smoke -addr 127.0.0.1:50051
 
 # Regenerate gen/ from protocol/. Needs protoc + protoc-gen-go + protoc-gen-go-grpc.
 generate:
