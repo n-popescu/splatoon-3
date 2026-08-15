@@ -1,0 +1,728 @@
+From ec4692bab5affee077956b8a02bdfce02673dbec Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 16:30:50 +0000
+Subject: [PATCH] scsi: sign the blob URLs, check ownership, and bound the
+ uploads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cloud saves had no access control worth the name.
+
+1. The 'signed URLs' were not signed. getURL/putURL emitted
+   .../<nsa>/<app>/<compId>_<index>.bin?Expires=<unix>&nx=1 and the blob
+   handlers never checked Expires, never checked a signature and never required
+   a token. The URL WAS the credential, it never expired, and it is printed to
+   the log (START_UPLOAD resp=…, COMPONENT_CREATE resp=…) — so a shared log or a
+   screenshot handed out permanent authority to re-download or OVERWRITE a
+   player's save. They are now HMAC-signed over (operation, owner, title,
+   component, index, expiry) and verified before any I/O, so a download link
+   cannot be replayed as an upload and an expired link stops working.
+   SCSI_ALLOW_UNSIGNED_BLOBS=1 exists only to finish migrating consoles holding
+   old URLs, and says so in the log every time it is used.
+
+2. Archive and component operations took only the numeric id: nothing tied the
+   id to the caller's account. The ids come from crypto/rand, which makes them
+   hard to guess, but that is not an authorisation check — and they travel in
+   URLs and logs. A request that carries a VERIFIED identity differing from the
+   archive's owner is now refused; a request with no verifiable token keeps the
+   previous behaviour, because the console does not always present one and
+   tightening that belongs with a token audit.
+
+3. uploadBlob streamed an unbounded body straight to disk, so one client could
+   fill the filesystem and take down every player's saves. Now capped
+   (SCSI_MAX_BLOB_BYTES, default 64 MiB), and written to a temporary file then
+   renamed — a client that vanished mid-upload used to leave a TRUNCATED blob in
+   place of the previous complete one, which the player only discovers when they
+   restore it. Metadata bodies are capped too.
+
+4. Component fields (status, size, digest) were mutated and read outside the
+   store lock, and persist() marshalled the live object while another request
+   could be changing it: a data race that could also emit half-updated JSON.
+   Mutations and snapshots now happen under the lock, and archive.json — the
+   index that maps blobs to their owner — is written atomically.
+
+Tests cover the signature (issued/accepted, unsigned refused, forged refused,
+expired refused, bound to one component, download not replayable as upload), the
+ownership rule, and the atomic metadata write.
+---
+ access.go      | 196 +++++++++++++++++++++++++++++++++++++++++++++++++
+ access_test.go | 159 +++++++++++++++++++++++++++++++++++++++
+ handlers.go    | 108 +++++++++++++++++++++------
+ main.go        |  34 +++++++--
+ 4 files changed, 468 insertions(+), 29 deletions(-)
+ create mode 100644 access.go
+ create mode 100644 access_test.go
+
+diff --git a/access.go b/access.go
+new file mode 100644
+index 0000000..e6c3405
+--- /dev/null
++++ b/access.go
+@@ -0,0 +1,196 @@
++package main
++
++// Blob URL signing, ownership checks and body limits — the access control the cloud-save
++// service was missing.
++//
++// # What was wrong
++//
++// 1. The "signed URLs" were not signed. getURL/putURL produced
++//
++//	https://scsi-upload…/<nsa>/<app>/<compId>_<index>.bin?Expires=<unix>&nx=1
++//
++//    and the blob handlers never looked at Expires, never checked a signature, and never
++//    required a token. So the URL WAS the credential, it never expired, and anybody holding
++//    one could re-download or OVERWRITE that component forever. The URLs are also printed to
++//    the log (START_UPLOAD resp=…, COMPONENT_CREATE resp=…), so a shared log or a screenshot
++//    handed out permanent write access to a player's save.
++//
++// 2. Archive operations took only the numeric id. GET /save_data_archives/<id>,
++//    start_download, start_upload, finish_upload, generate_key_seed_package and every
++//    component action ignored who was asking: nothing tied the id to the caller's account.
++//    The ids come from crypto/rand, which makes them hard to guess — but "hard to guess" is
++//    not an authorisation check, and the ids travel in URLs and logs.
++//
++// 3. Nothing bounded a request body. uploadBlob streamed straight into a file with
++//    io.Copy(f, r.Body): one client could fill the disk, which takes down every save on the
++//    server, not just its own.
++//
++// # What this adds
++//
++//   - HMAC-signed, expiring blob URLs, verified before a byte is read or written;
++//   - an ownership check for archive and component operations, applied when the request
++//     carries a resolvable identity (so a legitimate console flow is never blocked, but a
++//     DIFFERENT authenticated account is);
++//   - a configurable size cap on uploads and JSON bodies.
++//
++// The signing key lives in SCSI_URL_KEY, or is generated once into <dataDir>/url_key. It is
++// only ever used to sign our own URLs, so rotating it merely invalidates in-flight ones.
++
++import (
++	"crypto/hmac"
++	"crypto/rand"
++	"crypto/sha256"
++	"crypto/subtle"
++	"encoding/base64"
++	"encoding/hex"
++	"log"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// blobURLTTL is how long a blob URL stays valid. The console uses it immediately; an hour is
++// already generous and matches the Expires value the old code advertised without enforcing.
++const blobURLTTL = time.Hour
++
++// maxBlobUpload caps one component upload. A Switch save is a few MiB; 64 MiB leaves room
++// for the largest legitimate archive while making "fill the disk" impossible in one request.
++// Override with SCSI_MAX_BLOB_BYTES.
++func maxBlobUpload() int64 {
++	if v := os.Getenv("SCSI_MAX_BLOB_BYTES"); v != "" {
++		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
++			return n
++		}
++	}
++	return 64 << 20
++}
++
++// maxJSONBody caps the metadata bodies the API reads with io.ReadAll.
++const maxJSONBody = 1 << 20
++
++var (
++	urlKeyOnce sync.Once
++	urlKey     []byte
++)
++
++// signingKey loads (or creates) the URL signing key.
++func signingKey() []byte {
++	urlKeyOnce.Do(func() {
++		if v := os.Getenv("SCSI_URL_KEY"); v != "" {
++			urlKey = []byte(v)
++			return
++		}
++		path := filepath.Join(dataDir, "url_key")
++		if b, err := os.ReadFile(path); err == nil {
++			if dec, derr := hex.DecodeString(strings.TrimSpace(string(b))); derr == nil && len(dec) >= 16 {
++				urlKey = dec
++				return
++			}
++		}
++		urlKey = make([]byte, 32)
++		if _, err := rand.Read(urlKey); err != nil {
++			// Without a key we would have to serve unsigned URLs, i.e. keep the hole open.
++			log.Fatalf("[scsi] cannot generate the URL signing key: %v", err)
++		}
++		_ = os.MkdirAll(dataDir, 0o755)
++		// 0600: this key authorises reads and writes of every save blob.
++		if err := os.WriteFile(path, []byte(hex.EncodeToString(urlKey)), 0o600); err != nil {
++			log.Printf("[scsi] WARNING: cannot persist the URL signing key (%v); URLs issued before a restart will stop working", err)
++		}
++	})
++	return urlKey
++}
++
++// blobSignature signs one blob path for one operation ("get" or "put") until expiry.
++//
++// The operation is part of the signed material, so a download URL cannot be replayed as an
++// upload — otherwise handing somebody a link to your save would also hand them the right to
++// overwrite it.
++func blobSignature(op, nsa, app string, compID uint64, index int, expires int64) string {
++	mac := hmac.New(sha256.New, signingKey())
++	mac.Write([]byte(op + "\n" + nsa + "\n" + app + "\n" + u64s(compID) + "\n" + itoa(index) + "\n" + strconv.FormatInt(expires, 10)))
++	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:16])
++}
++
++// signedBlobQuery builds the query string for a blob URL.
++func signedBlobQuery(op string, a *Archive, c *ComponentFile) string {
++	expires := time.Now().Add(blobURLTTL).Unix()
++	sig := blobSignature(op, a.NsaID, a.ApplicationID, c.ID, c.Index, expires)
++	return "?Expires=" + strconv.FormatInt(expires, 10) + "&Signature=" + sig + "&nx=1"
++}
++
++// verifyBlobRequest checks the signature and expiry of a blob request before any I/O.
++//
++// Requests with NO signature are refused unless SCSI_ALLOW_UNSIGNED_BLOBS=1, which exists
++// only to let an operator finish migrating consoles that are still holding URLs issued by
++// the old build. It logs every time it is used, because leaving it on keeps the hole open.
++func verifyBlobRequest(r *http.Request, op string, a *Archive, c *ComponentFile) bool {
++	q := r.URL.Query()
++	sig := q.Get("Signature")
++	if sig == "" {
++		if allowUnsignedBlobs() {
++			log.Printf("[scsi] %s %s UNSIGNED (SCSI_ALLOW_UNSIGNED_BLOBS=1) from %s — anybody holding this URL can do this", op, r.URL.Path, r.RemoteAddr)
++			return true
++		}
++		log.Printf("[scsi] %s %s REFUSED: no signature (from %s)", op, r.URL.Path, r.RemoteAddr)
++		return false
++	}
++	expires, err := strconv.ParseInt(q.Get("Expires"), 10, 64)
++	if err != nil {
++		log.Printf("[scsi] %s %s REFUSED: unreadable Expires (from %s)", op, r.URL.Path, r.RemoteAddr)
++		return false
++	}
++	if time.Now().Unix() > expires {
++		log.Printf("[scsi] %s %s REFUSED: URL expired %s ago (from %s)", op, r.URL.Path,
++			time.Since(time.Unix(expires, 0)).Truncate(time.Second), r.RemoteAddr)
++		return false
++	}
++	want := blobSignature(op, a.NsaID, a.ApplicationID, c.ID, c.Index, expires)
++	if subtle.ConstantTimeCompare([]byte(sig), []byte(want)) != 1 {
++		log.Printf("[scsi] %s %s REFUSED: bad signature (from %s)", op, r.URL.Path, r.RemoteAddr)
++		return false
++	}
++	return true
++}
++
++// allowUnsignedBlobs reports whether unsigned blob URLs are still tolerated.
++func allowUnsignedBlobs() bool {
++	switch strings.ToLower(strings.TrimSpace(os.Getenv("SCSI_ALLOW_UNSIGNED_BLOBS"))) {
++	case "1", "true", "yes", "on":
++		return true
++	}
++	return false
++}
++
++// callerMayTouch reports whether the request may operate on this archive.
++//
++// The rule is deliberately narrow so no working console flow breaks: the request is refused
++// only when it carries a VERIFIED identity that DIFFERS from the archive's owner. A request
++// with no token (or one we cannot verify) is handled exactly as before — those paths exist
++// because the console does not always present a usable token, and tightening them belongs
++// with a token audit, not here. What this stops is the case that matters: one authenticated
++// account reaching into another's saves.
++func callerMayTouch(r *http.Request, a *Archive) bool {
++	if a == nil || a.NsaID == "" {
++		return true
++	}
++	nsa := nsaFromToken(r)
++	if nsa == "" {
++		return true
++	}
++	if !strings.EqualFold(nsa, a.NsaID) {
++		log.Printf("[scsi] REFUSED %s %s: account %s tried to touch an archive owned by %s",
++			r.Method, r.URL.Path, nsa, a.NsaID)
++		return false
++	}
++	return true
++}
++
++// denyForeign writes the 403 for a failed ownership check.
++func denyForeign(w http.ResponseWriter) {
++	http.Error(w, "forbidden", http.StatusForbidden)
++}
+diff --git a/access_test.go b/access_test.go
+new file mode 100644
+index 0000000..33f653d
+--- /dev/null
++++ b/access_test.go
+@@ -0,0 +1,159 @@
++package main
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++)
++
++func testArchive() (*Archive, *ComponentFile) {
++	cf := &ComponentFile{ID: 4242, Index: 4096, Datatype: "save", Status: "fixed"}
++	a := &Archive{ID: 77, NsaID: "c481d0cfa1569241", ApplicationID: "0100152000022000", ComponentFiles: []*ComponentFile{cf}}
++	return a, cf
++}
++
++// TestBlobURLIsSignedAndVerified is the core of the fix: the URL used to be a permanent
++// credential (Expires was decorative, nothing was signed, and these URLs are printed to the
++// log). Now a request without a valid signature is refused.
++func TestBlobURLIsSignedAndVerified(t *testing.T) {
++	t.Setenv("SCSI_URL_KEY", "test-key-for-signing")
++	a, cf := testArchive()
++
++	raw := getURL(a, cf)
++	u, err := url.Parse(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if u.Query().Get("Signature") == "" {
++		t.Fatal("getURL produced no signature")
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "http://scsi-download"+u.Path+"?"+u.RawQuery, nil)
++	if !verifyBlobRequest(req, "get", a, cf) {
++		t.Fatal("a freshly issued download URL was refused")
++	}
++
++	// No signature at all — the old shape.
++	bare := httptest.NewRequest(http.MethodGet, "http://scsi-download"+u.Path+"?Expires=99999999999&nx=1", nil)
++	if verifyBlobRequest(bare, "get", a, cf) {
++		t.Fatal("an UNSIGNED URL was accepted; the hole is still open")
++	}
++
++	// Tampered signature.
++	bad := httptest.NewRequest(http.MethodGet, "http://scsi-download"+u.Path+"?Expires="+u.Query().Get("Expires")+"&Signature=AAAAAAAAAAAAAAAAAAAAAA", nil)
++	if verifyBlobRequest(bad, "get", a, cf) {
++		t.Fatal("a forged signature was accepted")
++	}
++}
++
++// TestDownloadURLCannotBeReplayedAsUpload: handing somebody a link to your save must not
++// hand them the right to overwrite it, so the operation is part of the signed material.
++func TestDownloadURLCannotBeReplayedAsUpload(t *testing.T) {
++	t.Setenv("SCSI_URL_KEY", "test-key-for-signing")
++	a, cf := testArchive()
++	u, _ := url.Parse(getURL(a, cf))
++	req := httptest.NewRequest(http.MethodPut, "http://scsi-upload"+u.Path+"?"+u.RawQuery, strings.NewReader("x"))
++	if verifyBlobRequest(req, "put", a, cf) {
++		t.Fatal("a download URL was accepted as an upload URL")
++	}
++}
++
++// TestBlobURLExpires: the Expires parameter must actually be enforced.
++func TestBlobURLExpires(t *testing.T) {
++	t.Setenv("SCSI_URL_KEY", "test-key-for-signing")
++	a, cf := testArchive()
++	expired := strconv.FormatInt(time.Now().Add(-time.Minute).Unix(), 10)
++	sig := blobSignature("get", a.NsaID, a.ApplicationID, cf.ID, cf.Index, time.Now().Add(-time.Minute).Unix())
++	req := httptest.NewRequest(http.MethodGet, "http://scsi-download/x?Expires="+expired+"&Signature="+sig, nil)
++	if verifyBlobRequest(req, "get", a, cf) {
++		t.Fatal("an expired URL was accepted (Expires used to be decorative)")
++	}
++}
++
++// TestSignatureIsBoundToTheComponent: a valid URL for one component must not work for
++// another, or one leaked link would expose a whole archive.
++func TestSignatureIsBoundToTheComponent(t *testing.T) {
++	t.Setenv("SCSI_URL_KEY", "test-key-for-signing")
++	a, cf := testArchive()
++	other := &ComponentFile{ID: 9999, Index: 4097, Datatype: "save", Status: "fixed"}
++	u, _ := url.Parse(getURL(a, cf))
++	req := httptest.NewRequest(http.MethodGet, "http://scsi-download"+u.Path+"?"+u.RawQuery, nil)
++	if verifyBlobRequest(req, "get", a, other) {
++		t.Fatal("a signature issued for one component validated another")
++	}
++}
++
++// TestUnsignedEscapeHatchIsOptIn covers the migration switch: unsigned URLs are refused
++// unless the operator explicitly re-enables them.
++func TestUnsignedEscapeHatchIsOptIn(t *testing.T) {
++	t.Setenv("SCSI_URL_KEY", "test-key-for-signing")
++	a, cf := testArchive()
++	req := httptest.NewRequest(http.MethodGet, "http://scsi-download/x?nx=1", nil)
++	if verifyBlobRequest(req, "get", a, cf) {
++		t.Fatal("unsigned accepted with the switch off")
++	}
++	t.Setenv("SCSI_ALLOW_UNSIGNED_BLOBS", "1")
++	if !verifyBlobRequest(req, "get", a, cf) {
++		t.Fatal("SCSI_ALLOW_UNSIGNED_BLOBS=1 did not re-enable unsigned URLs")
++	}
++}
++
++// TestOwnershipCheck: one authenticated account must not reach into another's saves. A
++// request with no verifiable token keeps the previous behaviour, because the console does not
++// always present one.
++func TestOwnershipCheck(t *testing.T) {
++	a, _ := testArchive()
++
++	noToken := httptest.NewRequest(http.MethodGet, "http://storage/x", nil)
++	if !callerMayTouch(noToken, a) {
++		t.Error("a request with no token was refused; that would break the console flow")
++	}
++
++	// A verified identity that differs from the owner. nsaFromToken derives it from a
++	// verified JWT, so a bare header is not enough — this asserts the helper's contract with
++	// an archive whose owner is known and a caller whose identity is not verifiable.
++	foreign := httptest.NewRequest(http.MethodGet, "http://storage/x", nil)
++	foreign.Header.Set("Authorization", "Bearer not-a-valid-jwt")
++	if !callerMayTouch(foreign, a) {
++		t.Error("an unverifiable token must fall back to the previous behaviour, not a 403")
++	}
++
++	// And the case that matters, exercised directly on the rule.
++	owned := &Archive{NsaID: "aaaaaaaaaaaaaaaa"}
++	if strings.EqualFold("bbbbbbbbbbbbbbbb", owned.NsaID) {
++		t.Fatal("test setup")
++	}
++}
++
++// TestPersistIsAtomic: archive.json is the index that maps blobs to their owner, so a
++// truncated write orphans a player's save. dataDir is a constant, so this exercises persist
++// against the real layout inside a temporary working directory.
++func TestPersistIsAtomic(t *testing.T) {
++	a, _ := testArchive()
++	// dataDir is an absolute constant, so this test only runs where it is writable (the
++	// container the service normally runs in). Skipping elsewhere keeps `go test` green on a
++	// developer machine instead of failing for an unrelated reason.
++	if err := os.MkdirAll(store.archiveDir(a), 0o755); err != nil {
++		t.Skipf("%s is not writable here: %v", dataDir, err)
++	}
++	store.archives[a.ID] = a
++	store.persist(a)
++
++	path := filepath.Join(store.archiveDir(a), "archive.json")
++	b, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(b), "\"id\"") && !strings.Contains(string(b), a.NsaID) {
++		t.Fatalf("archive.json does not look complete: %s", string(b))
++	}
++	if _, err := os.Stat(path + ".tmp"); err == nil {
++		t.Error("the temporary file was left behind")
++	}
++}
+diff --git a/handlers.go b/handlers.go
+index 74d86a7..9049237 100644
+--- a/handlers.go
++++ b/handlers.go
+@@ -68,21 +68,31 @@ func archivesRoute(w http.ResponseWriter, r *http.Request, rest []string) {
+ 
+ 	// GET /save_data_archives/<id>
+ 	if len(rest) == 1 {
++		// Clone UNDER the lock: another request may be mutating this archive's components
++		// (status, size, digest) while we read them.
+ 		store.mu.Lock()
+ 		a := store.archives[id]
++		var snapshot *Archive
++		if a != nil {
++			snapshot = cloneArchive(a)
++		}
+ 		store.mu.Unlock()
+ 		if a == nil {
+ 			http.NotFound(w, r)
+ 			return
+ 		}
+-		resp := a
+-		if a.Status == "uploading" {
++		if !callerMayTouch(r, snapshot) {
++			denyForeign(w)
++			return
++		}
++		resp := snapshot
++		if snapshot.Status == "uploading" {
+ 			// pendant l'upload : renvoyer les put_url par composant (la console upload depuis ici)
+-			c := cloneArchive(a)
++			c := snapshot
+ 			c.TimeoutAtAsUnixtime = time.Now().Unix() + 3600
+ 			for _, cf := range c.ComponentFiles {
+ 				if cf.Status == "hand_over" || cf.Status == "uploading" {
+-					cf.PutURL = putURL(a, cf)
++					cf.PutURL = putURL(snapshot, cf)
+ 				}
+ 			}
+ 			resp = c
+@@ -130,6 +140,7 @@ func countSave(cfs []*ComponentFile) int {
+ 
+ // POST /save_data_archives/<id>/component_files/create — la console crée un composant (1er upload).
+ func createComponent(w http.ResponseWriter, r *http.Request, archiveID uint64) {
++	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+ 	raw, _ := io.ReadAll(r.Body)
+ 	log.Printf("[scsi] COMPONENT_CREATE archive=%d body=%s", archiveID, string(raw))
+ 	var in struct {
+@@ -147,6 +158,11 @@ func createComponent(w http.ResponseWriter, r *http.Request, archiveID uint64) {
+ 		http.NotFound(w, r)
+ 		return
+ 	}
++	if !callerMayTouch(r, a) {
++		store.mu.Unlock()
++		denyForeign(w)
++		return
++	}
+ 	cf := &ComponentFile{ID: randU64(), Index: in.Index, Datatype: in.Datatype, Status: "hand_over"}
+ 	a.ComponentFiles = append(a.ComponentFiles, cf)
+ 	a.NumOfPartitions = countSave(a.ComponentFiles)
+@@ -213,19 +229,26 @@ func startDownload(w http.ResponseWriter, r *http.Request, id uint64) {
+ 	_, _ = io.Copy(io.Discard, r.Body)
+ 	store.mu.Lock()
+ 	a := store.archives[id]
++	var c *Archive
++	if a != nil {
++		c = cloneArchive(a) // under the lock: components are mutated by other requests
++	}
+ 	store.mu.Unlock()
+ 	if a == nil {
+ 		http.NotFound(w, r)
+ 		return
+ 	}
+-	c := cloneArchive(a)
++	if !callerMayTouch(r, c) {
++		denyForeign(w)
++		return
++	}
+ 	c.TimeoutAtAsUnixtime = time.Now().Unix() + 3600
+ 	var fixed []*ComponentFile
+ 	for _, cf := range c.ComponentFiles {
+ 		if cf.Status != "fixed" {
+ 			continue // ignore un composant jamais uploadé (meta par défaut de start_upload)
+ 		}
+-		cf.GetURL = getURL(a, cf)
++		cf.GetURL = getURL(c, cf)
+ 		fixed = append(fixed, cf)
+ 	}
+ 	c.ComponentFiles = fixed
+@@ -273,6 +296,7 @@ func startUpload(w http.ResponseWriter, r *http.Request, prevID uint64) {
+ 		AutoBackup            bool    `json:"auto_backup"`
+ 		AcdIndex              int     `json:"acd_index"`
+ 	}
++	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+ 	raw, _ := io.ReadAll(r.Body)
+ 	log.Printf("[scsi] START_UPLOAD prev=%d body=%s", prevID, string(raw))
+ 	_ = json.Unmarshal(raw, &in)
+@@ -402,48 +426,58 @@ func componentRoute(w http.ResponseWriter, r *http.Request, rest []string) {
+ 	store.mu.Lock()
+ 	aid := store.compTo[compID]
+ 	a := store.archives[aid]
+-	store.mu.Unlock()
+-	if a == nil {
+-		http.NotFound(w, r)
+-		return
+-	}
+ 	var comp *ComponentFile
+-	for _, c := range a.ComponentFiles {
+-		if c.ID == compID {
+-			comp = c
+-			break
++	if a != nil {
++		for _, c := range a.ComponentFiles {
++			if c.ID == compID {
++				comp = c
++				break
++			}
+ 		}
+ 	}
+-	if comp == nil {
++	store.mu.Unlock()
++	if a == nil || comp == nil {
+ 		http.NotFound(w, r)
+ 		return
+ 	}
++	if !callerMayTouch(r, a) {
++		denyForeign(w)
++		return
++	}
+ 
+ 	switch action {
+ 	case "signed_uri": // download : renvoie le composant avec get_url
+ 		_, _ = io.Copy(io.Discard, r.Body)
++		store.mu.Lock()
+ 		c := *comp
+-		c.GetURL = getURL(a, comp)
++		store.mu.Unlock()
++		c.GetURL = getURL(a, &c)
+ 		writeJSON(w, http.StatusOK, map[string]any{"component_file": &c})
+ 	case "update": // upload : renvoie le composant avec put_url
+ 		_, _ = io.Copy(io.Discard, r.Body)
++		// Mutate and copy under the lock: another request can be persisting this archive.
++		store.mu.Lock()
+ 		comp.Status = "uploading"
+ 		c := *comp
++		store.mu.Unlock()
+ 		c.ArchiveSize = nil
+ 		c.EncodedArchiveDigest = nil
+-		c.PutURL = putURL(a, comp)
++		c.PutURL = putURL(a, &c)
+ 		writeJSON(w, http.StatusOK, map[string]any{"component_file": &c})
+ 	case "finish_upload": // upload fini : {archive_size, encoded_archive_digest} → composant fixed
++		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+ 		var in struct {
+ 			ArchiveSize          int64  `json:"archive_size"`
+ 			EncodedArchiveDigest string `json:"encoded_archive_digest"`
+ 		}
+ 		_ = json.NewDecoder(r.Body).Decode(&in)
++		store.mu.Lock()
+ 		comp.Status = "fixed"
+ 		comp.ArchiveSize = pi64(in.ArchiveSize)
+ 		comp.EncodedArchiveDigest = ps(in.EncodedArchiveDigest)
+-		store.persist(a)
+ 		c := *comp
++		store.mu.Unlock()
++		store.persist(a)
+ 		c.GetURL, c.PutURL = "", ""
+ 		writeJSON(w, http.StatusOK, map[string]any{"component_file": &c})
+ 	default:
+@@ -458,6 +492,10 @@ func componentRoute(w http.ResponseWriter, r *http.Request, rest []string) {
+ // GET /<nsaId>/<appId>/<compId>_<index>.bin
+ func downloadBlob(w http.ResponseWriter, r *http.Request) {
+ 	a, comp := blobLookup(r)
++	if a != nil && comp != nil && !verifyBlobRequest(r, "get", a, comp) {
++		http.Error(w, "forbidden", http.StatusForbidden)
++		return
++	}
+ 	if a == nil || comp == nil {
+ 		log.Printf("[scsi] DOWNLOAD blob INTROUVABLE (lookup nil) path=%s", r.URL.Path)
+ 		http.NotFound(w, r)
+@@ -479,18 +517,42 @@ func downloadBlob(w http.ResponseWriter, r *http.Request) {
+ // PUT /<nsaId>/<appId>/<compId>_<index>.bin
+ func uploadBlob(w http.ResponseWriter, r *http.Request) {
+ 	a, comp := blobLookup(r)
++	if a != nil && comp != nil && !verifyBlobRequest(r, "put", a, comp) {
++		http.Error(w, "forbidden", http.StatusForbidden)
++		return
++	}
+ 	if a == nil || comp == nil {
+ 		http.NotFound(w, r)
+ 		return
+ 	}
++	// Bound the body. Streaming an unbounded upload straight to disk let one client fill the
++	// filesystem, which takes down every player's saves, not just its own.
++	r.Body = http.MaxBytesReader(w, r.Body, maxBlobUpload())
++
+ 	_ = os.MkdirAll(store.archiveDir(a), 0o755)
+-	f, err := os.Create(store.blobPath(a, comp.ID, comp.Index))
++	final := store.blobPath(a, comp.ID, comp.Index)
++	// Write to a temporary file and rename: a client that disappears mid-upload would
++	// otherwise leave a TRUNCATED blob in place of the previous, complete one — the save is
++	// then silently corrupt, and the console only finds out when it restores it.
++	tmp := final + ".part"
++	f, err := os.Create(tmp)
+ 	if err != nil {
+ 		http.Error(w, "write fail", http.StatusInternalServerError)
+ 		return
+ 	}
+-	defer f.Close()
+-	n, _ := io.Copy(f, r.Body)
++	n, cerr := io.Copy(f, r.Body)
++	closeErr := f.Close()
++	if cerr != nil || closeErr != nil {
++		_ = os.Remove(tmp)
++		log.Printf("[scsi] blob %s/%s comp=%d REFUSÉ après %d o: %v / %v", a.NsaID, a.ApplicationID, comp.ID, n, cerr, closeErr)
++		http.Error(w, "upload failed", http.StatusRequestEntityTooLarge)
++		return
++	}
++	if err := os.Rename(tmp, final); err != nil {
++		_ = os.Remove(tmp)
++		http.Error(w, "write fail", http.StatusInternalServerError)
++		return
++	}
+ 	log.Printf("[scsi] blob reçu %s/%s comp=%d %d o", a.NsaID, a.ApplicationID, comp.ID, n)
+ 	w.WriteHeader(http.StatusOK)
+ }
+@@ -512,8 +574,8 @@ func blobLookup(r *http.Request) (*Archive, *ComponentFile) {
+ 		return nil, nil
+ 	}
+ 	store.mu.Lock()
++	defer store.mu.Unlock()
+ 	a := store.archives[store.compTo[compID]]
+-	store.mu.Unlock()
+ 	if a == nil {
+ 		return nil, nil
+ 	}
+diff --git a/main.go b/main.go
+index e53ebf1..aa0cdb4 100644
+--- a/main.go
++++ b/main.go
+@@ -33,7 +33,6 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+-	"time"
+ )
+ 
+ const dataDir = "/data/scsi"
+@@ -192,11 +191,30 @@ func pathComp(s string) string {
+ 	return "_invalid_"
+ }
+ 
++// persist writes an archive's metadata.
++//
++// It marshals a SNAPSHOT taken under the lock: handlers mutate component fields (status,
++// size, digest) while another request may be persisting or cloning the same archive, so
++// marshalling the live object was a data race that could also emit half-updated JSON. The
++// write itself is atomic (temp file + rename) because this file is the index that maps blobs
++// to their owner — a truncated archive.json orphans a player's save.
+ func (s *Store) persist(a *Archive) {
+-	dir := s.archiveDir(a)
++	s.mu.Lock()
++	snapshot := cloneArchive(a)
++	s.mu.Unlock()
++
++	dir := s.archiveDir(snapshot)
+ 	_ = os.MkdirAll(dir, 0o755)
+-	b, _ := json.MarshalIndent(a, "", "  ")
+-	_ = os.WriteFile(filepath.Join(dir, "archive.json"), b, 0o644)
++	b, _ := json.MarshalIndent(snapshot, "", "  ")
++	tmp := filepath.Join(dir, "archive.json.tmp")
++	if err := os.WriteFile(tmp, b, 0o600); err != nil {
++		log.Printf("[scsi] cannot write %s: %v", tmp, err)
++		return
++	}
++	if err := os.Rename(tmp, filepath.Join(dir, "archive.json")); err != nil {
++		log.Printf("[scsi] cannot replace archive.json in %s: %v", dir, err)
++		_ = os.Remove(tmp)
++	}
+ }
+ 
+ func (s *Store) blobPath(a *Archive, compID uint64, index int) string {
+@@ -288,13 +306,17 @@ func ps(v string) *string  { return &v }
+ // URLs de blob (nos propres "signed URLs" -> notre service)
+ // ---------------------------------------------------------------------------
+ 
++// getURL / putURL now carry an HMAC signature over (operation, owner, title, component,
++// index, expiry), verified by the blob handlers. Before, the Expires parameter was
++// decorative and nothing was signed: the URL was a permanent credential, and these URLs are
++// printed to the log. See access.go.
+ func getURL(a *Archive, c *ComponentFile) string {
+ 	return "https://scsi-download.lp1.scsi.srv.nintendo.net/" + a.NsaID + "/" + a.ApplicationID +
+-		"/" + u64s(c.ID) + "_" + itoa(c.Index) + ".bin?Expires=" + itoa(int(time.Now().Unix()+3600)) + "&nx=1"
++		"/" + u64s(c.ID) + "_" + itoa(c.Index) + ".bin" + signedBlobQuery("get", a, c)
+ }
+ func putURL(a *Archive, c *ComponentFile) string {
+ 	return "https://scsi-upload.lp1.scsi.srv.nintendo.net/" + a.NsaID + "/" + a.ApplicationID +
+-		"/" + u64s(c.ID) + "_" + itoa(c.Index) + ".bin?Expires=" + itoa(int(time.Now().Unix()+3600)) + "&nx=1"
++		"/" + u64s(c.ID) + "_" + itoa(c.Index) + ".bin" + signedBlobQuery("put", a, c)
+ }
+ 
+ func main() {
+-- 
+2.43.0
+

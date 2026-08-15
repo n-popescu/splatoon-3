@@ -1,0 +1,451 @@
+From 180f35665068b8e8eb2903ba0a88adb40a49c358 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 16:30:50 +0000
+Subject: [PATCH] nncs: write the NAT files atomically, and stop the tables
+ growing without end
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The NAT-check responder is the only component that observes a console's real
+external UDP endpoint, and it publishes what it sees to two files that
+nextendo-nex reads on the JOIN path (natbridge.go, GetSessionURLs) to hand a
+joiner the host's reachable address.
+
+Both files were written with os.WriteFile, which TRUNCATES and then writes, and
+they were rewritten in full on EVERY probe. A reader landing in that window sees
+an empty or half-written file: the host's endpoint looks missing, the joiner is
+handed the useless WebSocket TCP port, its probe never lands, and the console
+reports a communication error. The added test reproduces it — with the old code
+239 of 500 reads saw a truncated file, i.e. roughly half of the joins that
+happened while any client was probing.
+
+Also fixed:
+
+* the write is now debounced (250 ms) and only happens when the CONTENT changed.
+  Rewriting both files on every datagram, on an unauthenticated public UDP port,
+  is an amplification: cheap packets in, sustained disk writes out.
+* entries expire (30 min). The tables — and the files, which are rewritten
+  whole — grew for the life of the process, one entry per source IP that ever
+  sent a datagram, which is a memory and disk exhaustion primitive on a public
+  port. An observed endpoint is only meaningful for the session that produced it.
+
+Tests: a reader never sees a truncated file while writes are in flight; stale
+entries are dropped from both files; the cone/symmetric classification the relay
+depends on still holds; an unchanged re-probe does not touch the disk. Verified
+with -race.
+---
+ main.go           | 160 ++++++++++++++++++++++++++++++++------
+ nat_files_test.go | 191 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 326 insertions(+), 25 deletions(-)
+ create mode 100644 nat_files_test.go
+
+diff --git a/main.go b/main.go
+index cc0e931..902b903 100644
+--- a/main.go
++++ b/main.go
+@@ -22,6 +22,15 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"time"
++)
++
++// The debounced writer's own state, separate from natMu so a write in flight never blocks a
++// probe being answered.
++var (
++	natWriteMu    sync.Mutex
++	natWriteDirty bool
++	natWriteTimer *time.Timer
+ )
+ 
+ // natMap remembers each client's observed external UDP endpoint (public IP -> UDP
+@@ -31,7 +40,7 @@ import (
+ // for P2P — this bridge gives the server the right UDP port.
+ var (
+ 	natMu   sync.Mutex
+-	natMap  = map[string]string{}
++	natMap  = map[string]natEntry{}
+ 	natFile = func() string {
+ 		if v := os.Getenv("NNCS_NAT_FILE"); v != "" {
+ 			return v
+@@ -43,7 +52,7 @@ var (
+ 	// mapping) NAT hands out a DIFFERENT external port per destination, so if the same IP
+ 	// shows different source ports across our two probe ports (10025 vs 10125) it is
+ 	// symmetric — the case the direct natbridge cannot hole-punch, i.e. the relay trigger.
+-	natSeen  = map[string]map[int]int{}
++	natSeen  = map[string]natTypeEntry{}
+ 	typeFile = func() string {
+ 		if v := os.Getenv("NNCS_TYPE_FILE"); v != "" {
+ 			return v
+@@ -52,36 +61,119 @@ var (
+ 	}()
+ )
+ 
++// natWriteDebounce bounds how often the shared files are rewritten. A probe arrives per
++// client per test (and a flood of forged probes can arrive from anywhere — this is an
++// unauthenticated UDP port), and the old code rewrote BOTH files, in full, on every single
++// datagram. That is an amplification: cheap packets in, sustained disk writes out.
++const natWriteDebounce = 250 * time.Millisecond
++
++// natEntryTTL forgets a client that has not probed for a long time. Without it the tables
++// — and the files, which are rewritten whole — grew for the life of the process, one entry
++// per source IP that ever sent a datagram. A public UDP port plus an unbounded table is a
++// memory and disk exhaustion primitive; an external endpoint is only meaningful for the
++// session that produced it anyway.
++const natEntryTTL = 30 * time.Minute
++
++// natEntry is one observed external endpoint.
++type natEntry struct {
++	port int
++	seen time.Time
++}
++
++// natTypeEntry is one client's per-destination-port mapping, used to tell a cone NAT from
++// a symmetric one.
++type natTypeEntry struct {
++	ports map[int]int
++	seen  time.Time
++}
++
++// recordNAT remembers a client's observed external UDP endpoint for the NEX server's NAT
++// bridge, and schedules a write of the shared file.
+ func recordNAT(ip string, port int) {
+ 	natMu.Lock()
+-	defer natMu.Unlock()
+-	natMap[ip] = strconv.Itoa(port)
+-	var b strings.Builder
+-	for k, v := range natMap {
+-		b.WriteString(k + " " + v + "\n")
+-	}
+-	_ = os.WriteFile(natFile, []byte(b.String()), 0644)
++	prev, existed := natMap[ip]
++	natMap[ip] = natEntry{port: port, seen: time.Now()}
++	changed := !existed || prev.port != port
++	natMu.Unlock()
++	scheduleNATWrite(changed)
+ }
+ 
+-// classifyNAT records the (dstPort -> external srcPort) mapping for an IP and, once it
+-// has seen the client on both probe ports, writes cone|sym to /data/nat_types.txt so the
+-// secure server's shouldRelay() can decide whether the P2P link needs the relay.
++// classifyNAT records the (destination port -> observed source port) mapping for an IP.
++// A symmetric NAT hands out a DIFFERENT external port per destination, so an IP seen with
++// different source ports across our two probe ports (10025 vs 10125) is symmetric — the
++// case a direct hole-punch cannot solve, i.e. the relay trigger.
+ func classifyNAT(ip string, dstPort, srcPort int) {
+ 	natMu.Lock()
+-	defer natMu.Unlock()
+-	m := natSeen[ip]
+-	if m == nil {
+-		m = map[int]int{}
+-		natSeen[ip] = m
++	e, ok := natSeen[ip]
++	if !ok {
++		e = natTypeEntry{ports: map[int]int{}}
+ 	}
+-	m[dstPort] = srcPort
++	changed := e.ports[dstPort] != srcPort
++	e.ports[dstPort] = srcPort
++	e.seen = time.Now()
++	natSeen[ip] = e
++	natMu.Unlock()
++	scheduleNATWrite(changed)
++}
+ 
+-	var b strings.Builder
+-	for cip, ports := range natSeen {
++// scheduleNATWrite coalesces file writes. changed=true means the CONTENT differs, which is
++// what makes the write worth doing at all; a repeated probe from a stable client does not
++// touch the disk.
++func scheduleNATWrite(changed bool) {
++	if !changed {
++		return
++	}
++	natWriteMu.Lock()
++	defer natWriteMu.Unlock()
++	natWriteDirty = true
++	if natWriteTimer != nil {
++		return
++	}
++	natWriteTimer = time.AfterFunc(natWriteDebounce, func() {
++		natWriteMu.Lock()
++		natWriteTimer = nil
++		dirty := natWriteDirty
++		natWriteDirty = false
++		natWriteMu.Unlock()
++		if dirty {
++			flushNATFiles()
++		}
++	})
++}
++
++// flushNATFiles rewrites both shared files, expiring stale entries as it goes.
++//
++// # Why the write is atomic
++//
++// nextendo-nex reads nat_endpoints.txt on the JOIN path (natbridge.go, GetSessionURLs) to
++// hand a joiner the host's real UDP endpoint. os.WriteFile truncates the file and then
++// writes it, so a reader that lands in that window sees an empty or half-written file: the
++// host's endpoint looks missing, the joiner is handed the useless WebSocket TCP port, its
++// probe never lands and the console reports a communication error. Writing to a temporary
++// file and renaming makes the swap atomic — a reader sees either the old contents or the
++// new ones, never a truncated file. The old code rewrote on EVERY probe, so this window was
++// open constantly, and the resulting failure looked random.
++func flushNATFiles() {
++	now := time.Now()
++
++	natMu.Lock()
++	var ep strings.Builder
++	for ip, e := range natMap {
++		if now.Sub(e.seen) > natEntryTTL {
++			delete(natMap, ip)
++			continue
++		}
++		ep.WriteString(ip + " " + strconv.Itoa(e.port) + "\n")
++	}
++	var ty strings.Builder
++	for ip, e := range natSeen {
++		if now.Sub(e.seen) > natEntryTTL {
++			delete(natSeen, ip)
++			continue
++		}
+ 		sym := false
+-		var first int
+-		got := false
+-		for _, sp := range ports {
++		first, got := 0, false
++		for _, sp := range e.ports {
+ 			if !got {
+ 				first, got = sp, true
+ 			} else if sp != first {
+@@ -92,9 +184,27 @@ func classifyNAT(ip string, dstPort, srcPort int) {
+ 		if sym {
+ 			kind = "sym"
+ 		}
+-		b.WriteString(cip + " " + kind + "\n")
++		ty.WriteString(ip + " " + kind + "\n")
++	}
++	natMu.Unlock()
++
++	writeAtomic(natFile, ep.String())
++	writeAtomic(typeFile, ty.String())
++}
++
++// writeAtomic writes content to path via a temporary file in the SAME directory (a rename
++// is only atomic within one filesystem) followed by a rename. 0644 is kept: the NEX server
++// runs as another user and has to read these.
++func writeAtomic(path, content string) {
++	tmp := path + ".tmp"
++	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
++		log.Printf("[nncs] cannot write %s: %v", tmp, err)
++		return
++	}
++	if err := os.Rename(tmp, path); err != nil {
++		log.Printf("[nncs] cannot replace %s: %v", path, err)
++		_ = os.Remove(tmp)
+ 	}
+-	_ = os.WriteFile(typeFile, []byte(b.String()), 0644)
+ }
+ 
+ func ipToU32(ip net.IP) uint32 {
+diff --git a/nat_files_test.go b/nat_files_test.go
+new file mode 100644
+index 0000000..6c170d1
+--- /dev/null
++++ b/nat_files_test.go
+@@ -0,0 +1,191 @@
++package main
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++// withTempFiles points the shared files at a temp directory and resets the tables.
++func withTempFiles(t *testing.T) (string, string) {
++	t.Helper()
++	dir := t.TempDir()
++	natFile = filepath.Join(dir, "nat_endpoints.txt")
++	typeFile = filepath.Join(dir, "nat_types.txt")
++	natMu.Lock()
++	natMap = map[string]natEntry{}
++	natSeen = map[string]natTypeEntry{}
++	natMu.Unlock()
++	return natFile, typeFile
++}
++
++// TestFilesAreWrittenAtomically is the important one.
++//
++// nextendo-nex reads nat_endpoints.txt on the JOIN path to hand a joiner the host's real
++// UDP endpoint. The old code used os.WriteFile, which truncates before writing, so a reader
++// landing in that window saw an empty or half-written file — the joiner was handed the
++// useless WebSocket TCP port and the console reported a communication error. This asserts a
++// reader NEVER sees a truncated file while writes are happening.
++func TestFilesAreWrittenAtomically(t *testing.T) {
++	path, _ := withTempFiles(t)
++
++	// A realistic table: several hosts, so a truncated write would be visible.
++	for i := 0; i < 40; i++ {
++		recordNAT("203.0.113."+itoa(i), 30000+i)
++	}
++	flushNATFiles()
++	full, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	wantLines := strings.Count(string(full), "\n")
++	if wantLines != 40 {
++		t.Fatalf("expected 40 lines, got %d", wantLines)
++	}
++
++	stop := make(chan struct{})
++	var wg sync.WaitGroup
++	// Writer: keep rewriting the file while the reader reads it.
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for {
++			select {
++			case <-stop:
++				return
++			default:
++				flushNATFiles()
++			}
++		}
++	}()
++
++	// Reader: the NEX server's natbridge, which reads this file on every join.
++	short := 0
++	for i := 0; i < 500; i++ {
++		b, err := os.ReadFile(path)
++		if err != nil {
++			// The rename never unlinks, so the file must always be openable.
++			short++
++			continue
++		}
++		if strings.Count(string(b), "\n") != wantLines {
++			short++
++		}
++	}
++	close(stop)
++	wg.Wait()
++
++	if short != 0 {
++		t.Fatalf("%d read(s) saw a truncated/incomplete file — the join path would hand out the wrong endpoint", short)
++	}
++}
++
++// TestStaleEntriesExpire: the tables (and the files, which are rewritten whole) used to grow
++// for the life of the process, one entry per source IP that ever sent a datagram — on an
++// unauthenticated public UDP port.
++func TestStaleEntriesExpire(t *testing.T) {
++	path, typePath := withTempFiles(t)
++
++	recordNAT("198.51.100.7", 31000)
++	classifyNAT("198.51.100.7", 10025, 31000)
++	// Backdate it past the TTL.
++	natMu.Lock()
++	natMap["198.51.100.7"] = natEntry{port: 31000, seen: time.Now().Add(-2 * natEntryTTL)}
++	natSeen["198.51.100.7"] = natTypeEntry{ports: map[int]int{10025: 31000}, seen: time.Now().Add(-2 * natEntryTTL)}
++	natMu.Unlock()
++
++	recordNAT("198.51.100.8", 31001) // a live client
++	flushNATFiles()
++
++	b, _ := os.ReadFile(path)
++	if strings.Contains(string(b), "198.51.100.7") {
++		t.Error("a stale endpoint is still published")
++	}
++	if !strings.Contains(string(b), "198.51.100.8") {
++		t.Error("the live endpoint is missing")
++	}
++	natMu.Lock()
++	n := len(natMap)
++	natMu.Unlock()
++	if n != 1 {
++		t.Errorf("table holds %d entries, want 1 (the stale one must be dropped)", n)
++	}
++	tb, _ := os.ReadFile(typePath)
++	if strings.Contains(string(tb), "198.51.100.7") {
++		t.Error("a stale NAT classification is still published")
++	}
++}
++
++// TestSymmetricNATIsClassified freezes the cone/symmetric decision the relay depends on.
++func TestSymmetricNATIsClassified(t *testing.T) {
++	_, typePath := withTempFiles(t)
++
++	// Same source port on both probe ports: cone.
++	classifyNAT("198.51.100.10", 10025, 40000)
++	classifyNAT("198.51.100.10", 10125, 40000)
++	// Different source port per destination: symmetric.
++	classifyNAT("198.51.100.11", 10025, 40001)
++	classifyNAT("198.51.100.11", 10125, 40002)
++	flushNATFiles()
++
++	b, _ := os.ReadFile(typePath)
++	got := string(b)
++	if !strings.Contains(got, "198.51.100.10 cone") {
++		t.Errorf("cone NAT not classified: %q", got)
++	}
++	if !strings.Contains(got, "198.51.100.11 sym") {
++		t.Errorf("symmetric NAT not classified: %q", got)
++	}
++}
++
++// TestRepeatedProbesDoNotRewrite: a stable client re-probing must not touch the disk. The
++// old code rewrote both files, in full, on every datagram — an amplification on an
++// unauthenticated UDP port.
++func TestRepeatedProbesDoNotRewrite(t *testing.T) {
++	path, _ := withTempFiles(t)
++	recordNAT("192.0.2.5", 32000)
++	flushNATFiles()
++	st, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	first := st.ModTime()
++
++	time.Sleep(10 * time.Millisecond)
++	for i := 0; i < 100; i++ {
++		recordNAT("192.0.2.5", 32000) // identical: nothing changed
++	}
++	// No flush is scheduled for unchanged content, so the file must be untouched.
++	st2, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !st2.ModTime().Equal(first) {
++		t.Error("an unchanged re-probe rewrote the file")
++	}
++}
++
++func itoa(n int) string {
++	if n == 0 {
++		return "0"
++	}
++	var b [12]byte
++	i := len(b)
++	neg := n < 0
++	if neg {
++		n = -n
++	}
++	for n > 0 {
++		i--
++		b[i] = byte('0' + n%10)
++		n /= 10
++	}
++	if neg {
++		i--
++		b[i] = '-'
++	}
++	return string(b[i:])
++}
+-- 
+2.43.0
+
