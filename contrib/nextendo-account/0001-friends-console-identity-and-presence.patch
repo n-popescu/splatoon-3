@@ -1,0 +1,1703 @@
+From 516d174850a84b3e99cd06be8bbe09de1eaee0b2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 15:56:55 +0000
+Subject: [PATCH] friends: resolve console identity per request, and report
+ console presence
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Server-side half of the fix for the two Switch friends problems: friends who
+never appear online, and every console adding friends as ONE account (the
+project owner's friend code showing up on everybody's console). Full analysis
+in FRIENDS-FIX.md.
+
+WHY IT HAPPENED
+
+A Switch presents a BAAS id_token carrying "sub" (the BAAS/NSA user id, per
+console USER) and "bs:did" (the device account id, per console). nx-account has
+to turn that into a Nextendo account on EVERY request, and the only tool it had
+was /internal/pid-by-bsdid, which compares bs:did against a value DERIVED from
+the account PID. That works only when the console adopts the id we minted — but
+a console caches its device account in system save 8000000000000010 and presents
+its OWN id forever. So a console provisioned before its account existed, or
+provisioned while somebody else's account was linked, matches nothing, the
+lookup 404s, and nx-account falls back to a process-wide "last authenticated
+account" variable (the comment on internalPIDByBsDid says exactly that). Every
+console then converges on one identity. Reissuing a friend code changes the
+code, not the binding — which is what players observed.
+
+Presence had a parallel gap: the table has a 90s TTL and only two writers (the
+emulator fork, and a NEX game server for players inside that game). Nothing
+reported a console that is simply on and online, and nx-account — which does see
+the console's presence — had no way to write it, because /api/presence needs a
+user bearer token a server-to-server caller does not have.
+
+WHAT THIS COMMIT ADDS
+
+Console identity bindings (nintendo_bindings.go, nintendo_bindings_store.go)
+  * Account.NintendoBindings: the ids a console ACTUALLY presents, several per
+    account (one per console/profile), with bound_at/last_seen and an operator
+    label.
+  * GET /internal/whoami?baas=&bsdid= — the single resolution entry point.
+    Order: binding on baas -> binding on bs_did -> derived BaasID -> derived
+    BsDid. There is deliberately NO fifth step: an unresolvable console gets
+    404 and the caller must refuse it. That absent fallback IS the fix.
+  * POST /internal/bind — records a binding, called by the console link flow
+    with the ids from the token the console actually presented. This is what
+    makes a console with a pre-existing device account work WITHOUT a factory
+    reset: we learn its id instead of expecting it to adopt ours.
+  * POST /internal/unbind — the recovery path for a console poisoned by the old
+    fallback (unbind from the wrong account, bind to the right one).
+  * A binding belongs to exactly ONE account: binding an id another account owns
+    is refused with 409, never silently moved — a console quietly changing owner
+    would be the same bug in a new shape.
+  * O(1) resolution through an in-memory reverse index, replacing a full account
+    scan on every console request (also a small denial-of-service surface).
+  * Ids are canonicalised to %016x so the hex form from an id_token and the
+    decimal form other paths use (/api/nsa) resolve to the same binding, with
+    the "1000 is both" ambiguity resolved by length.
+  * /internal/pid-by-bsdid now uses the same index, so it improves before
+    nx-account changes at all, and logs an explicit line when it cannot resolve.
+
+Console presence (console_presence.go, presence.go)
+  * POST /internal/presence — a single-account presence write for an internal
+    caller, which is what nx-account needs and did not have. status 0 clears the
+    presence immediately, so "went offline" is instant instead of a TTL expiry.
+  * noteConsoleOnline(): /internal/identity, /internal/pid-by-bsdid,
+    /internal/whoami and /internal/login are called BY nx-account on the
+    console's behalf, so reaching them is proof the console is on and connected.
+    Each now publishes an online presence — this works with NO change on the
+    nx-account side.
+  * A stronger, fresher presence is never downgraded: a player in a game stays
+    "playing" instead of being demoted by a friend-list poll.
+  * The console presence has its own, longer TTL
+    (NEXTENDO_CONSOLE_PRESENCE_TTL, default 5 min), because a console polls less
+    often than a game reports and 90s would make friends flicker.
+  * clearPresence() added to presence.go for the immediate-offline path.
+
+NPLN bridge (npln_friends.go)
+  * Publishes "favorite" per friend and a "blocked" array. Splatoon 3 reads
+    both: without the flag every friend looks unstarred in game while the
+    website shows the star, and an empty block list lets the game match a player
+    with somebody they blocked.
+
+WHAT nx-account STILL HAS TO DO (not public, specified in FRIENDS-FIX.md)
+  Resolve with /internal/whoami using the ids from the id_token of the request
+  being served; DELETE the global fallback and answer an auth error on 404;
+  cache per (sub, bs:did) pair only; call /internal/bind at link time; call
+  /internal/presence on the console's presence updates; and map each friend's
+  presenceStatus into the BAAS friend object.
+
+TESTS
+  Explicit and derived resolution, 404-with-no-pid for an unknown console
+  (the regression guard for the whole bug), binding exclusivity (409),
+  unbind/rebind, hex vs decimal, two consoles keeping two distinct friend codes,
+  presence published on resolution, "playing" not downgraded, immediate offline,
+  unknown PID refused, and favorites/blocks in the NPLN bridge.
+
+No existing route changes shape; everything added is a new /internal/* route or
+a new field.
+---
+ .gitignore                 |   3 +
+ FRIENDS-FIX.md             | 204 ++++++++++++++++++++
+ README.md                  |  15 ++
+ console_presence.go        | 183 ++++++++++++++++++
+ main.go                    |  35 +++-
+ nintendo_bindings.go       | 359 +++++++++++++++++++++++++++++++++++
+ nintendo_bindings_store.go | 278 +++++++++++++++++++++++++++
+ nintendo_bindings_test.go  | 371 +++++++++++++++++++++++++++++++++++++
+ npln_friends.go            |  26 ++-
+ 9 files changed, 1467 insertions(+), 7 deletions(-)
+ create mode 100644 FRIENDS-FIX.md
+ create mode 100644 console_presence.go
+ create mode 100644 nintendo_bindings.go
+ create mode 100644 nintendo_bindings_store.go
+ create mode 100644 nintendo_bindings_test.go
+
+diff --git a/.gitignore b/.gitignore
+index 42dc887..cc3f085 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,3 +13,6 @@ internal_key.txt
+ accounts.json
+ sessions.json
+ bans.json
++
++# build output
++/nextendo-account
+diff --git a/FRIENDS-FIX.md b/FRIENDS-FIX.md
+new file mode 100644
+index 0000000..67656ae
+--- /dev/null
++++ b/FRIENDS-FIX.md
+@@ -0,0 +1,204 @@
++# Fixing the Switch friends system
++
++This fork adds the server-side half of the fix for two problems reported on real
++Switch hardware:
++
++> **A.** A lot of people are friends but never appear online — as if the online status is never shared.
++>
++> **B.** When adding someone on the Switch, it adds them **as the person who wrote the code**: his
++> friend code always appears. Reissuing a friend code does not help.
++
++Nothing in this fork changes how the website or the existing games behave. Every addition is a new
++`/internal/*` route or a new field; existing routes keep their shape.
++
++---
++
++## Problem B: every console resolves to one account
++
++### What was happening
++
++A Switch presents a BAAS `id_token` on every request:
++
++```
++sub      the BAAS/NSA user id   (per console USER)
++bs:did   the device account id  (per console)
++```
++
++`nx-account` (the Switch-facing server, not in the public org) must turn that into a Nextendo account
++on **every** request. The only tool it had was `/internal/pid-by-bsdid`, which compares `bs:did`
++against a value **derived from the account PID**:
++
++```go
++BsDid = HMAC(secret, "bsdid:" + pid)[:8]
++```
++
++That works only if the console adopts the id *we* minted. A console caches its device account in
++system save `8000000000000010` and presents **its own** id forever — so a console provisioned before
++the account existed, or provisioned while somebody else's account was linked, matches nothing. The
++lookup 404s, and `nx-account` then falls back to a process-wide "last authenticated account"
++variable. The comment on `internalPIDByBsDid` in `main.go` says so in as many words:
++
++> *"Sans ça, nx-account retombait sur une variable globale (le dernier compte authentifié) et livrait
++> le compte d'autrui."*
++
++Result: every console converges on one identity — whoever set the server up. His friend code is shown
++to everybody, and friend requests are sent as him. Reissuing a friend code changes the code, not the
++binding, which is exactly what was observed.
++
++### What this fork adds
++
++**A real binding table.** The ids a console *actually presents*, stored per account, several per
++account (one per console or profile):
++
++```json
++"nintendo_bindings": [
++  { "baas_id": "8ca8d7842f865b2f", "bs_did": "581ea786a91f1689",
++    "label": "switch-lite", "bound_at": "…", "last_seen": "…" }
++]
++```
++
++**`GET /internal/whoami?baas=<sub>&bsdid=<bs:did>`** — the single resolution entry point:
++
++```json
++200 {"found":true,"pid":1800000042,"via":"binding:baas","nickname":"…","friendCode":"SW-…"}
++404 {"found":false}
++```
++
++Resolution order: explicit binding on `baas` → explicit binding on `bs_did` → derived `BaasID` →
++derived `BsDid`. **There is deliberately no fifth step**: an unresolvable console gets 404 and the
++caller must refuse the request. It is never turned into a default, a "last seen" or a "first"
++account.
++
++**`POST /internal/bind`** — records a binding, called by the console link flow with the ids from the
++token the console *actually presented*. This is what makes a console with a pre-existing device
++account work **without a factory reset**: instead of expecting it to adopt our derived id, we learn
++its own.
++
++A binding belongs to exactly one account. Binding an id that another account already owns is refused
++with **409**, not silently moved — a console quietly changing owner would be the same bug in a new
++shape.
++
++**`POST /internal/unbind`** — removes a binding, which is the recovery path for a console poisoned by
++the old fallback (unbind from the wrong account, bind to the right one).
++
++**`/internal/pid-by-bsdid` now uses the binding index too**, so `nx-account` improves even before it
++is changed, and both endpoints log an explicit line when they cannot resolve.
++
++**O(1) resolution.** The old lookup walked every account on every console request (also a small
++denial-of-service surface). The bindings are indexed in memory and rebuilt on write.
++
++**Hex and decimal are the same id.** A console id is a 64-bit number that appears as 16 hex characters
++in an `id_token` and in decimal on other paths (`/api/nsa` is called with the decimal form). Ids are
++canonicalised to `%016x`, with the ambiguity resolved by length (exactly 16 hex characters is hex,
++otherwise decimal is tried first).
++
++---
++
++## Problem A: friends never appear online
++
++### What was happening
++
++`presence.go` is an in-memory table with a 90-second TTL and **two** writers:
++
++| Writer | Covers |
++| --- | --- |
++| `POST /api/presence` | an emulator user, mostly around private-battle hosting |
++| `POST /internal/presence-batch` | a player **inside** Splatoon 2 / MK8 / … |
++
++Nothing reported a console that is simply **on and online** — Home Menu, a game with no Nextendo
++server, or a menu before matchmaking. The Home Menu friend list is exactly where players look at each
++other's status, so a friend was normally offline.
++
++And `nx-account`, which *does* see the console's presence, had no way to write it: `/api/presence`
++needs a user bearer token it does not have, and `presence-batch` is shaped for "these PIDs are in this
++game".
++
++### What this fork adds
++
++**`POST /internal/presence`** — a single-account presence write for a server-to-server caller:
++
++```json
++{"pid":1800000042,"status":1,"app_id":"0100c2500fc20000","app_field":"<base64>"}
++```
++
++`status: 0` clears the presence **immediately**, so "went offline" is instant instead of a TTL expiry
++— a friend list that takes 90 seconds to notice somebody left looks broken.
++
++**Liveness from console traffic** (`noteConsoleOnline`). `/internal/identity`,
++`/internal/pid-by-bsdid`, `/internal/whoami` and `/internal/login` are called *by* `nx-account` on the
++console's behalf, so reaching them **is** proof the console is on and connected. Each now publishes an
++"online" presence for the resolved account. This works with **no change on the `nx-account` side at
++all**.
++
++Two rules keep it honest:
++
++- a **stronger, fresher presence is never downgraded** — a player in a game stays "playing", they do
++  not get demoted to "online" by a friend-list poll;
++- the console presence has its **own, longer TTL** (`NEXTENDO_CONSOLE_PRESENCE_TTL`, default 5 min),
++  because a console polls less often than a game reports and 90 s would make friends flicker.
++
++**Favorites and blocks in the NPLN bridge.** `/internal/npln-friends` now publishes `favorite` per
++friend and a `blocked` array. Splatoon 3 reads both: without the flag every friend looks unstarred in
++game while the website shows the star, and an empty block list lets the game match a player with
++somebody they blocked.
++
++---
++
++## What `nx-account` still has to do
++
++`nx-account` is not in the public organisation, so it could not be changed here. Its part is small:
++
++1. **Resolve per request** with `GET /internal/whoami?baas=<sub>&bsdid=<bs:did>`, taking both values
++   from the **`id_token` of the request being served**.
++2. **Delete the global fallback.** On 404, answer the console with an authentication error. A player
++   seeing "please link your Nextendo account" is a fixable problem; a player silently acting as
++   somebody else is not.
++3. **Cache per (`sub`, `bs:did`) pair only** — never in a process-wide variable.
++4. **At link time, call `POST /internal/bind`** with the ids from the token the console presented, so
++   its existing device account becomes the recognised binding.
++5. **On the console's presence update, call `POST /internal/presence`** with the resolved caller's PID.
++6. **When building the friend list**, map each friend's `presenceStatus` (already in
++   `/internal/identity`'s `friends[]`) into the BAAS friend object, and mark presence
++   deliverable/receivable in both directions.
++
++Steps 1, 2 and 4 fix problem B. Steps 5 and 6 finish problem A (the liveness signal already helps
++without them).
++
++---
++
++## Configuration
++
++| Variable | Default | Meaning |
++| --- | --- | --- |
++| `NEXTENDO_CONSOLE_PRESENCE_TTL` | `300` (seconds; a duration like `2m` also works) | how long a console counts as online after we last heard from it |
++
++No other configuration changes. All new routes are `/internal/*` and are gated by
++`internal_guard.go` plus `NEXTENDO_INTERNAL_KEY`, like their neighbours.
++
++## Tests
++
++```sh
++go test -run "Whoami|Binding|ConsolePresence|InternalPresence|NplnFriends|Unbind|TwoProfiles" .
++```
++
++They encode the rules that matter, not just the happy path:
++
++- an explicit binding resolves, and a **derived** id still resolves (old consoles keep working);
++- an unknown console gets **404 with no `pid` field** — the regression guard for the whole bug;
++- a binding is **exclusive** (409), and unbind → rebind moves a console deliberately;
++- hex and decimal spellings of one id resolve to the same binding;
++- two consoles on two accounts get **two different friend codes**;
++- resolving an identity publishes presence, and does **not** downgrade a "playing" presence;
++- `status: 0` clears presence at once; an unknown PID is refused;
++- `npln-friends` publishes favorites and blocks.
++
++## Recovering an already-poisoned console
++
++The console has cached the owner's device account. After deploying this and the `nx-account` change:
++
++- **bind it deliberately** — `POST /internal/unbind` on the owner's account for those ids, then sign in
++  on the console with the intended account so the link flow binds them; or
++- **reset the console's binding** — clear the local user's online binding (the Linkalho-style
++  `isNnLinked` / device-account state described in `Prelude-Nro`'s notes) and let it provision fresh.
++
++Reissuing a friend code does not help, and now there is a reason why: the code was never the identity.
+diff --git a/README.md b/README.md
+index 8700252..709deb1 100644
+--- a/README.md
++++ b/README.md
+@@ -38,6 +38,21 @@ secrets, keys, credentials, or personal data are baked into the source**: the to
+ internal key, SMTP credentials, and admin list are all read from the environment (or files) at
+ startup, and the admin space is closed until you configure `NEXTENDO_ADMIN_EMAILS`.
+ 
++## This fork: the Switch friends fix
++
++This is a fork of [`NextendoNetwork/nextendo-account`](https://github.com/NextendoNetwork/nextendo-account)
++carrying the server-side half of the fix for two reported Switch problems: friends never appearing
++online, and every console adding friends as one single account (the project owner's friend code showing
++up everywhere).
++
++It adds console **identity bindings** (`/internal/whoami`, `/internal/bind`, `/internal/unbind`) so
++"who is calling?" is resolved per request from the ids the console actually presents — and **fails
++closed** instead of falling back to a default account — plus a console **presence** writer
++(`/internal/presence`) and presence liveness derived from console traffic.
++
++**Read [FRIENDS-FIX.md](FRIENDS-FIX.md)** for the full analysis, the API, and the small change the
++(non-public) `nx-account` component still needs.
++
+ ## Internal routes
+ 
+ `/api/*` routes are public; `/internal/*` routes (identity, login, presence) are a control plane that
+diff --git a/console_presence.go b/console_presence.go
+new file mode 100644
+index 0000000..193ef54
+--- /dev/null
++++ b/console_presence.go
+@@ -0,0 +1,183 @@
++package main
++
++// Console presence — the other half of the fix for "friends are never online".
++//
++// # The bug this exists for
++//
++// presence.go holds an in-memory presence table with a 90-second TTL, and it had
++// exactly two writers:
++//
++//	POST /api/presence          the emulator fork, around private-battle hosting
++//	POST /internal/presence-batch  a NEX game server, for players INSIDE that game
++//
++// Nothing reported a console that is simply on and online: sitting in the Home
++// Menu, in a game with no Nextendo server, or in a menu before matchmaking. The
++// Home Menu friend list is exactly where players look at each other's status, so
++// the normal state of a Switch friend was "offline" — the reported symptom.
++//
++// nx-account (the Switch-facing server) DOES see that presence, but this server
++// gave it no way to write it: /api/presence needs a user bearer token, which a
++// server-to-server component does not have, and presence-batch is shaped for
++// "these PIDs are in this game".
++//
++// # What this file adds
++//
++//	POST /internal/presence   a single-account presence write for an internal caller
++//	noteConsoleOnline(pid)     called on every successful console identity
++//	                           resolution, because a console that polls its friend
++//	                           list is online by definition
++//
++// The console presence uses a LONGER TTL than a game presence: a console polls
++// less often than a game reports, and 90 seconds would make friends flicker.
++// A stronger, fresher presence (status 2 = playing) is never downgraded by it.
++
++import (
++	"encoding/json"
++	"log"
++	"net/http"
++	"os"
++	"strconv"
++	"sync"
++	"time"
++)
++
++// Presence status values, as nn::friends and the NPLN bridge use them.
++const (
++	presenceStatusOffline = 0
++	presenceStatusOnline  = 1
++	presenceStatusPlaying = 2
++)
++
++// consolePresenceTTL is how long a console counts as online after we last heard
++// from it. Configurable because it trades responsiveness (a friend going offline)
++// against flicker (a console that polls slowly), and the right value depends on
++// how chatty the deployment's consoles are.
++func consolePresenceTTL() time.Duration {
++	if v := os.Getenv("NEXTENDO_CONSOLE_PRESENCE_TTL"); v != "" {
++		if n, err := strconv.Atoi(v); err == nil && n > 0 {
++			return time.Duration(n) * time.Second
++		}
++		if d, err := time.ParseDuration(v); err == nil && d > 0 {
++			return d
++		}
++	}
++	return 5 * time.Minute
++}
++
++// consoleOnline remembers the last time a console was heard from, per account.
++// Kept beside the main presence table (rather than inside it) so it can have its
++// own TTL and can never overwrite a richer game presence.
++var consoleOnline = struct {
++	mu   sync.Mutex
++	seen map[uint64]time.Time
++}{seen: map[uint64]time.Time{}}
++
++// noteConsoleOnline records that we just served an authenticated request for this
++// account's console.
++//
++// Called from the identity endpoints (/internal/identity, /internal/pid-by-bsdid,
++// /internal/whoami, /internal/login). Those are called by nx-account on the
++// console's behalf, so reaching them IS proof the console is on and connected —
++// the cheapest reliable presence signal available, and it needs no change on the
++// nx-account side at all.
++func noteConsoleOnline(pid uint64) {
++	if pid == 0 {
++		return
++	}
++	consoleOnline.mu.Lock()
++	consoleOnline.seen[pid] = time.Now()
++	// Bounded: a flood of unknown PIDs must not grow this table without end.
++	if len(consoleOnline.seen) > 20000 {
++		cutoff := time.Now().Add(-consolePresenceTTL())
++		for k, t := range consoleOnline.seen {
++			if t.Before(cutoff) {
++				delete(consoleOnline.seen, k)
++			}
++		}
++	}
++	consoleOnline.mu.Unlock()
++
++	// Publish it as a real presence so every existing consumer — the Switch
++	// friend list, the website, the NPLN bridge — sees it, but never downgrade a
++	// fresher "playing" presence to a plain "online".
++	if p, ok := getPresence(pid); ok && p.Status > presenceStatusOnline {
++		return
++	}
++	setPresence(pid, presenceStatusOnline, "", "", "")
++}
++
++// consoleIsOnline reports whether the account's console was heard from within the
++// console TTL. Used by the presence view so a console that stopped polling is
++// dropped even if the main presence table has not expired yet.
++func consoleIsOnline(pid uint64) bool {
++	consoleOnline.mu.Lock()
++	t, ok := consoleOnline.seen[pid]
++	consoleOnline.mu.Unlock()
++	return ok && time.Since(t) < consolePresenceTTL()
++}
++
++// clearPresence removes a presence immediately instead of waiting for the TTL.
++//
++// Lives here rather than in presence.go so this fork does not touch that file:
++// same package, so it reaches the table directly. Used when a console reports
++// that it went offline — a friend list that takes 90 seconds to notice somebody
++// left looks broken.
++func clearPresence(pid uint64) {
++	presenceMu.Lock()
++	delete(presenceByPID, pid)
++	presenceMu.Unlock()
++}
++
++// internalPresence (INTERNAL) writes ONE account's presence.
++//
++//	POST /internal/presence
++//	{"pid":1800000042,"status":1,"app_id":"0100c2500fc20000","app_field":"<base64>","app_detail":""}
++//
++// This is what nx-account calls when the console reports its presence
++// (nn::friends UpdateUserPresence). It is the server-to-server counterpart of
++// /api/presence, which needs a user token nx-account does not have.
++//
++// status 0 clears the presence immediately, so "went offline" is instant rather
++// than a TTL expiry — a friend list that takes 90 seconds to notice somebody left
++// looks broken.
++func (s *server) internalPresence(w http.ResponseWriter, r *http.Request) {
++	if !internalKeyOK(r) {
++		writeErr(w, http.StatusUnauthorized, "interne")
++		return
++	}
++	if r.Method != http.MethodPost {
++		writeErr(w, http.StatusMethodNotAllowed, "POST attendu")
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
++	var in struct {
++		PID       uint64 `json:"pid"`
++		Status    int    `json:"status"`
++		AppID     string `json:"app_id"`
++		AppField  string `json:"app_field"`
++		AppDetail string `json:"app_detail"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.PID == 0 {
++		writeErr(w, http.StatusBadRequest, "pid requis")
++		return
++	}
++	// The PID must be a real account: an unchecked write would let an internal
++	// caller fill the presence table with anything.
++	if _, err := s.store.ByPID(in.PID); err != nil {
++		writeErr(w, http.StatusNotFound, "compte introuvable")
++		return
++	}
++	if in.Status == presenceStatusOffline {
++		clearPresence(in.PID)
++		consoleOnline.mu.Lock()
++		delete(consoleOnline.seen, in.PID)
++		consoleOnline.mu.Unlock()
++		log.Printf("[presence] pid=%d hors ligne (poussé par la console)", in.PID)
++		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
++		return
++	}
++	setPresence(in.PID, in.Status, in.AppField, in.AppID, clampDetail(in.AppDetail))
++	noteConsoleOnline(in.PID)
++	log.Printf("[presence] pid=%d status=%d app=%q (poussé par la console)", in.PID, in.Status, in.AppID)
++	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
++}
+diff --git a/main.go b/main.go
+index 1277141..09558c0 100644
+--- a/main.go
++++ b/main.go
+@@ -2748,6 +2748,11 @@ func (s *server) internalIdentity(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	acct.ensureNintendoIDs() // deterministic; fills in-memory for pre-existing accounts
++	// Cette requête est faite PAR la console (nx-account l'appelle pour la servir) :
++	// c'est donc la preuve que la console est allumée et connectée. On s'en sert comme
++	// source de présence — sans quoi un ami n'apparaît « en ligne » que s'il est dans un
++	// jeu NEX, ce qui explique les amis éternellement hors ligne. Voir console_presence.go.
++	noteConsoleOnline(acct.PID)
+ 	nickname := displayName(acct)
+ 	// pseudo affiché = Profile.Name (pseudo synchronisé depuis la console) sinon Username.
+ 	// avatar = image uploadée OU icône de galerie choisie (résolue depuis avatarsDir).
+@@ -2789,13 +2794,18 @@ func (s *server) internalPIDByBsDid(w http.ResponseWriter, r *http.Request) {
+ 		writeErr(w, http.StatusBadRequest, "bsdid manquant")
+ 		return
+ 	}
+-	for _, a := range s.store.AllAccounts() {
+-		a.ensureNintendoIDs() // déterministe : remplit BsDid pour les comptes anciens
+-		if strings.ToLower(a.BsDid) == want {
+-			writeJSON(w, http.StatusOK, map[string]any{"pid": a.PID})
+-			return
+-		}
++	// Résolution par l'index des liaisons (O(1)) puis par les ids DÉRIVÉS : une
++	// console qui possédait déjà un compte d'appareil présente SON id, jamais le
++	// nôtre, et c'est ce cas qui faisait échouer la résolution — donc retomber sur
++	// le compte par défaut de nx-account. /internal/whoami est l'entrée à préférer
++	// (elle accepte aussi le « sub ») ; celle-ci reste pour la compatibilité.
++	if acct, via, err := s.resolveConsole("", want); err == nil && acct != nil {
++		noteConsoleOnline(acct.PID)
++		log.Printf("[pid-by-bsdid] %s -> pid=%d via %s", want, acct.PID, via)
++		writeJSON(w, http.StatusOK, map[string]any{"pid": acct.PID, "via": via})
++		return
+ 	}
++	log.Printf("[pid-by-bsdid] %s -> AUCUN COMPTE (le client doit être refusé, jamais rattaché à un compte par défaut)", want)
+ 	writeErr(w, http.StatusNotFound, "bs:did inconnu")
+ }
+ 
+@@ -2821,6 +2831,11 @@ func (s *server) internalLogin(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	acct.ensureNintendoIDs()
++	// La page de liaison vient d'authentifier ce compte SUR la console : elle est
++	// donc en ligne. (nx-account doit en profiter pour appeler /internal/bind avec
++	// les ids que la console présente réellement — c'est ce qui rend une console
++	// déjà provisionnée utilisable sans réinitialisation.)
++	noteConsoleOnline(acct.PID)
+ 	nickname := displayName(acct)
+ 	// pseudo affiché = Profile.Name (synchronisé depuis la console) sinon Username.
+ 	// avatar = image uploadée OU icône de galerie choisie (résolue depuis avatarsDir).
+@@ -3021,6 +3036,14 @@ func main() {
+ 	mux.HandleFunc("/internal/resolve", internalOnly("/internal/resolve", srv.internalResolve))                     // nx-account resolves a friend code / BAAS id -> account (add-by-code)
+ 	mux.HandleFunc("/internal/friend-request", internalOnly("/internal/friend-request", srv.internalFriendRequest)) // nx-account records a friend request sent from the console
+ 	mux.HandleFunc("/internal/npln-friends", internalOnly("/internal/npln-friends", srv.internalNplnFriends))       // npln-s3 (S3/NPLN) reads the unified Nextendo friend graph
++	// Liaisons d'identité console (voir nintendo_bindings.go) : la résolution
++	// « qui appelle ? » par REQUÊTE, sans aucun repli sur un compte par défaut.
++	mux.HandleFunc("/internal/whoami", internalOnly("/internal/whoami", srv.internalWhoami)) // console (sub + bs:did) -> compte, 404 sinon
++	mux.HandleFunc("/internal/bind", internalOnly("/internal/bind", srv.internalBind))       // enregistre l'identité RÉELLE d'une console
++	mux.HandleFunc("/internal/unbind", internalOnly("/internal/unbind", srv.internalUnbind)) // retire une liaison (déplacer une console)
++	// Présence poussée par la console (voir console_presence.go) : la moitié
++	// manquante de la présence — sans elle un ami n'apparaît jamais en ligne.
++	mux.HandleFunc("/internal/presence", internalOnly("/internal/presence", srv.internalPresence))
+ 	mux.HandleFunc("/internal/identity", internalOnly("/internal/identity", srv.internalIdentity))                  // nx-account pulls the Nextendo identity for a real CFW Switch
+ 	mux.HandleFunc("/internal/pid-by-bsdid", internalOnly("/internal/pid-by-bsdid", srv.internalPIDByBsDid))        // nx-account résout le bs:did d'une requête -> compte (identité par requête)
+ 	mux.HandleFunc("/internal/login", internalOnly("/internal/login", srv.internalLogin))                           // nx-account's account-link page validates Nextendo credentials here
+diff --git a/nintendo_bindings.go b/nintendo_bindings.go
+new file mode 100644
+index 0000000..aff5a18
+--- /dev/null
++++ b/nintendo_bindings.go
+@@ -0,0 +1,359 @@
++package main
++
++// Console identity bindings — the fix for "every Switch adds friends as the same
++// person".
++//
++// # The bug this exists for
++//
++// A Switch authenticates with a BAAS *device account* and presents an id_token on
++// every request:
++//
++//	sub      the BAAS/NSA user id   (per console user)
++//	bs:did   the device account id  (per console)
++//
++// nx-account (the Switch-facing server) has to turn those into a Nextendo account
++// on EVERY request. Until now the only way to do that was to compare them against
++// ids DERIVED from the account PID:
++//
++//	BaasID = HMAC(secret, "baas:"  + pid)[:8]
++//	BsDid  = HMAC(secret, "bsdid:" + pid)[:8]
++//
++// That only works if the console adopts the id *we* minted. A console caches its
++// device account in system save 8000000000000010 and presents its own id forever —
++// so a console provisioned before the account existed, or provisioned while
++// somebody else's account was linked, matches nothing. The lookup 404s, and
++// nx-account then falls back to a process-wide "last authenticated account"
++// variable (the comment on internalPIDByBsDid says so explicitly). Every console
++// therefore converges onto ONE identity: whoever set the server up. Their friend
++// code is shown to everybody, and friend requests are sent as them. Reissuing a
++// friend code changes the code, not the binding, which is exactly what was
++// observed.
++//
++// # What this file adds
++//
++//   - a real binding table: the ids a console ACTUALLY presents, stored per
++//     account, several per account (one per console/profile);
++//   - GET  /internal/whoami — the single resolution entry point, which answers
++//     404 and NOTHING ELSE when it cannot resolve. There is no default identity;
++//   - POST /internal/bind — records a binding (called by the console link flow);
++//   - POST /internal/unbind — removes one.
++//
++// A binding belongs to exactly one account: binding an id that is already bound
++// elsewhere is refused with 409 rather than silently moved, so two consoles can
++// never resolve to the same account by accident.
++//
++// nx-account is not part of this repository. The change it needs is small and is
++// specified in the fork's README section and in the splatoon-3 repository's
++// docs/FRIENDS.md: resolve with /internal/whoami using the ids from the
++// id_token of the request being served, and DELETE the global fallback.
++
++import (
++	"encoding/json"
++	"fmt"
++	"log"
++	"net/http"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// NintendoBinding is one console/profile identity bound to an account.
++type NintendoBinding struct {
++	// BaasID is the BAAS/NSA user id the console presents in the id_token "sub".
++	// Per console USER, which is what makes this the right key: two profiles on
++	// one console are two players.
++	BaasID string `json:"baas_id,omitempty"`
++	// BsDid is the device account id ("bs:did"). Per console.
++	BsDid string `json:"bs_did,omitempty"`
++	// NaID is the Nintendo-Account-shaped id, when the console presents one.
++	NaID string `json:"na_id,omitempty"`
++	// Label is free text for the operator ("switch-lite", "oled"), never used
++	// for resolution.
++	Label   string    `json:"label,omitempty"`
++	BoundAt time.Time `json:"bound_at"`
++	// LastSeen is refreshed on every successful resolution, so an operator can
++	// tell a live console from an old one.
++	LastSeen time.Time `json:"last_seen,omitempty"`
++}
++
++// resolveConsole is the ONE resolution function: it turns the console identity a
++// request carries into the Nextendo account that owns it.
++//
++// Order, most specific first:
++//
++//  1. an explicit binding on the BAAS/NSA id — per console USER, so it tells two
++//     profiles on one console apart;
++//  2. an explicit binding on the device id;
++//  3. the DERIVED BaasID (a console that adopted the id we minted);
++//  4. the DERIVED BsDid.
++//
++// Anything else returns ErrNotFound. There is deliberately no fifth step: the
++// missing fifth step IS the fix. A caller that gets an error must refuse the
++// console's request, never fall back to a default, "first" or "last seen" account.
++//
++// A successful DERIVED match is promoted into the binding table, so the next
++// lookup for that console is O(1) and the table self-heals into a complete
++// picture of who plays on what.
++func (s *server) resolveConsole(baasID, bsDid string) (*Account, string, error) {
++	baasID, bsDid = normalizeHexID(baasID), normalizeHexID(bsDid)
++	if baasID == "" && bsDid == "" {
++		return nil, "", ErrNotFound
++	}
++	table := openBindings()
++
++	if pid, via, ok := table.Resolve(baasID, bsDid); ok {
++		acct, err := s.store.ByPID(pid)
++		if err != nil {
++			// A binding whose account is gone (deleted account): drop it rather
++			// than keep resolving to nothing.
++			_ = table.Unbind(pid, baasID, bsDid)
++			return nil, "", ErrNotFound
++		}
++		table.Touch(pid, baasID, bsDid)
++		return acct, via, nil
++	}
++
++	// Derived ids: the console adopted what we minted. O(accounts), but only on
++	// the first request of such a console — it is promoted to a binding below.
++	for _, a := range s.store.AllAccounts() {
++		a.ensureNintendoIDs()
++		switch {
++		case baasID != "" && normalizeHexID(a.BaasID) == baasID:
++			s.promoteBinding(a.PID, baasID, bsDid, a.NaID)
++			return a, "derived:baas", nil
++		case bsDid != "" && normalizeHexID(a.BsDid) == bsDid:
++			s.promoteBinding(a.PID, baasID, bsDid, a.NaID)
++			return a, "derived:bsdid", nil
++		}
++	}
++	return nil, "", ErrNotFound
++}
++
++// promoteBinding records a console identity discovered through the derived ids.
++// Failure is logged and ignored: it is an optimisation, not a requirement.
++func (s *server) promoteBinding(pid uint64, baasID, bsDid, naID string) {
++	if _, err := openBindings().Bind(pid, NintendoBinding{
++		BaasID: baasID, BsDid: bsDid, NaID: naID, Label: "auto (id dérivé)",
++	}); err != nil && err != errBindingTaken {
++		log.Printf("[bind] promotion automatique pid=%d échouée : %v", pid, err)
++	}
++}
++
++// internalWhoami (INTERNAL) resolves the console identity carried by a request
++// into the Nextendo account that owns it.
++//
++//	GET /internal/whoami?baas=<sub>&bsdid=<bs:did>
++//	200 {"pid":1800000042,"via":"binding:baas","username":"…","friendCode":"SW-…"}
++//	404 {"found":false}
++//
++// FAIL-CLOSED, and that is the whole point of this endpoint: an unresolvable
++// console gets 404 and the caller must refuse the request. It must never be
++// turned into a default, a "last seen" or a "first" account — that is the bug
++// this file exists to kill.
++func (s *server) internalWhoami(w http.ResponseWriter, r *http.Request) {
++	if !internalKeyOK(r) {
++		writeErr(w, http.StatusUnauthorized, "interne")
++		return
++	}
++	q := r.URL.Query()
++	baasID := normalizeHexID(q.Get("baas"))
++	bsDid := normalizeHexID(q.Get("bsdid"))
++	if baasID == "" && bsDid == "" {
++		writeErr(w, http.StatusBadRequest, "baas et/ou bsdid requis")
++		return
++	}
++
++	acct, via, err := s.resolveConsole(baasID, bsDid)
++	if err != nil || acct == nil {
++		// The single most important log line of this feature: it says a console
++		// reached the server with an identity nobody owns — precisely the case
++		// where the old code silently served somebody else's account.
++		log.Printf("[whoami] baas=%q bsdid=%q -> AUCUN COMPTE (le client doit être refusé, jamais rattaché à un compte par défaut)", baasID, bsDid)
++		writeJSON(w, http.StatusNotFound, map[string]any{"found": false})
++		return
++	}
++	// A console that resolves is a console that is on and online: this is the
++	// cheapest, most reliable presence signal we have (see console_presence.go).
++	noteConsoleOnline(acct.PID)
++	log.Printf("[whoami] baas=%q bsdid=%q -> pid=%d (%s) via %s", baasID, bsDid, acct.PID, acct.Username, via)
++	writeJSON(w, http.StatusOK, map[string]any{
++		"found":      true,
++		"pid":        acct.PID,
++		"via":        via,
++		"username":   acct.Username,
++		"nickname":   displayName(acct),
++		"friendCode": acct.FriendCode,
++		"baasUserID": acct.BaasID,
++		"bsDid":      acct.BsDid,
++	})
++}
++
++// internalBind (INTERNAL) records the console identity of an account.
++//
++//	POST /internal/bind
++//	{"pid":1800000042,"baas_id":"8ca8d7842f865b2f","bs_did":"581ea786a91f1689","label":"switch-1"}
++//
++// Called by the console account-link flow with the ids from the token the console
++// ACTUALLY presented. That is what makes a console with a pre-existing device
++// account work without a factory reset: instead of expecting it to adopt our
++// derived id, we learn its own.
++//
++// 409 when another account already owns one of the ids. Silently moving a
++// binding would recreate the bug in a new shape (a console quietly changing
++// owner), so it is refused and the operator has to unbind it first.
++func (s *server) internalBind(w http.ResponseWriter, r *http.Request) {
++	if !internalKeyOK(r) {
++		writeErr(w, http.StatusUnauthorized, "interne")
++		return
++	}
++	if r.Method != http.MethodPost {
++		writeErr(w, http.StatusMethodNotAllowed, "POST attendu")
++		return
++	}
++	var in struct {
++		PID    uint64 `json:"pid"`
++		BaasID string `json:"baas_id"`
++		BsDid  string `json:"bs_did"`
++		NaID   string `json:"na_id"`
++		Label  string `json:"label"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
++		writeErr(w, http.StatusBadRequest, "json invalide")
++		return
++	}
++	in.BaasID, in.BsDid, in.NaID = normalizeHexID(in.BaasID), normalizeHexID(in.BsDid), normalizeHexID(in.NaID)
++	if in.PID == 0 || (in.BaasID == "" && in.BsDid == "") {
++		writeErr(w, http.StatusBadRequest, "pid et (baas_id ou bs_did) requis")
++		return
++	}
++	// The account must exist: binding a console to a PID nobody owns would create
++	// an identity that resolves to nothing.
++	acct, err := s.store.ByPID(in.PID)
++	if err != nil {
++		writeErr(w, http.StatusNotFound, "compte introuvable")
++		return
++	}
++	created, err := openBindings().Bind(in.PID, NintendoBinding{
++		BaasID:  in.BaasID,
++		BsDid:   in.BsDid,
++		NaID:    in.NaID,
++		Label:   clampLabel(in.Label),
++		BoundAt: time.Now().UTC(),
++	})
++	switch {
++	case err == errBindingTaken:
++		log.Printf("[bind] pid=%d baas=%q bsdid=%q REFUSÉ : déjà lié à un autre compte", in.PID, in.BaasID, in.BsDid)
++		writeErr(w, http.StatusConflict, "cette console est déjà liée à un autre compte")
++		return
++	case err != nil:
++		writeErr(w, http.StatusInternalServerError, "erreur")
++		return
++	}
++	log.Printf("[bind] pid=%d (%s) baas=%q bsdid=%q label=%q nouveau=%v", acct.PID, acct.Username, in.BaasID, in.BsDid, in.Label, created)
++	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "created": created, "pid": acct.PID})
++}
++
++// internalUnbind (INTERNAL) removes a console binding from an account.
++//
++//	POST /internal/unbind  {"pid":…, "baas_id":"…", "bs_did":"…"}
++//
++// Needed to move a console from one account to another (the recovery path for a
++// console that was poisoned by the old fallback behaviour).
++func (s *server) internalUnbind(w http.ResponseWriter, r *http.Request) {
++	if !internalKeyOK(r) {
++		writeErr(w, http.StatusUnauthorized, "interne")
++		return
++	}
++	if r.Method != http.MethodPost {
++		writeErr(w, http.StatusMethodNotAllowed, "POST attendu")
++		return
++	}
++	var in struct {
++		PID    uint64 `json:"pid"`
++		BaasID string `json:"baas_id"`
++		BsDid  string `json:"bs_did"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.PID == 0 {
++		writeErr(w, http.StatusBadRequest, "pid requis")
++		return
++	}
++	if err := openBindings().Unbind(in.PID, in.BaasID, in.BsDid); err != nil {
++		writeErr(w, http.StatusNotFound, "liaison introuvable")
++		return
++	}
++	log.Printf("[bind] pid=%d liaison retirée (baas=%q bsdid=%q)", in.PID, in.BaasID, in.BsDid)
++	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
++}
++
++// internalKeyOK checks the shared internal key the other /internal/* routes use.
++// Same rule as the existing handlers: when the key is unset (a co-located
++// single-host deployment) the application-layer check is skipped and
++// internal_guard.go's source-address check is the only gate.
++func internalKeyOK(r *http.Request) bool {
++	k := os.Getenv("NEXTENDO_INTERNAL_KEY")
++	return k == "" || r.Header.Get("X-Internal-Key") == k
++}
++
++// normalizeHexID puts a console id into ONE canonical form, so the same identity
++// always maps to the same binding however it was spelled.
++//
++// This is fiddlier than it looks. A console id is a 64-bit number that appears as
++// 16 hex characters in an id_token ("581ea786a91f1689") but in DECIMAL on other
++// paths (the console stores it as a u64, and the NEX auth's /api/nsa is called
++// with the decimal form). Worse, a short string like "1000" is valid hex AND valid
++// decimal. The rule that resolves the ambiguity:
++//
++//	exactly 16 hex characters  -> hex   (the id_token form is always 16 wide)
++//	otherwise parses as decimal -> decimal
++//	otherwise parses as hex      -> hex
++//	otherwise                    -> kept verbatim (not a number at all)
++//
++// and the result is always printed as %016x, so "1000", "0x3e8"-style hex and
++// "00000000000003e8" all land on the same key.
++func normalizeHexID(s string) string {
++	s = strings.ToLower(strings.TrimSpace(s))
++	if s == "" {
++		return ""
++	}
++	if len(s) == 16 && isHexID(s) {
++		if v, err := strconv.ParseUint(s, 16, 64); err == nil {
++			return fmt.Sprintf("%016x", v)
++		}
++	}
++	if v, err := strconv.ParseUint(s, 10, 64); err == nil {
++		return fmt.Sprintf("%016x", v)
++	}
++	if v, err := strconv.ParseUint(s, 16, 64); err == nil {
++		return fmt.Sprintf("%016x", v)
++	}
++	return s
++}
++
++// isHexID reports whether s is made of hex digits only.
++func isHexID(s string) bool {
++	for _, r := range s {
++		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
++			return false
++		}
++	}
++	return len(s) > 0
++}
++
++// clampLabel bounds the operator label. It comes from a caller and is displayed,
++// so it is bounded here rather than trusted.
++func clampLabel(s string) string {
++	s = strings.TrimSpace(s)
++	const max = 48
++	if len(s) > max {
++		return s[:max]
++	}
++	out := make([]rune, 0, len(s))
++	for _, r := range s {
++		if r < 0x20 || r == 0x7f {
++			continue
++		}
++		out = append(out, r)
++	}
++	return string(out)
++}
+diff --git a/nintendo_bindings_store.go b/nintendo_bindings_store.go
+new file mode 100644
+index 0000000..7292d43
+--- /dev/null
++++ b/nintendo_bindings_store.go
+@@ -0,0 +1,278 @@
++package main
++
++// Store side of the console identity bindings (see nintendo_bindings.go for why
++// they exist).
++//
++// # Why a sidecar file instead of a field on Account
++//
++// Bindings live in their OWN JSON file rather than inside accounts.json, and the
++// index lives here rather than inside jsonStore. That is deliberate: this fork
++// then touches upstream's data model not at all, so it rebases cleanly onto
++// nextendo-account whenever upstream moves, and an operator can inspect, back up
++// or delete the binding table without going near the account file.
++//
++// Resolution is O(1) through two reverse indexes. The old bs:did lookup walked
++// every account on every console request, which was both slow and a small
++// denial-of-service surface on a path a console hits constantly.
++
++import (
++	"encoding/json"
++	"errors"
++	"log"
++	"os"
++	"sync"
++	"time"
++)
++
++// errBindingTaken means the console identity already belongs to another account.
++var errBindingTaken = errors.New("binding already belongs to another account")
++
++// bindingTable is the persisted binding store.
++type bindingTable struct {
++	path string
++
++	mu sync.RWMutex
++	// Accounts maps an account PID to the console identities bound to it. A
++	// player may have several (one per console or per profile).
++	Accounts map[uint64][]NintendoBinding `json:"accounts"`
++
++	// Reverse indexes, derived from Accounts and rebuilt on load and on write.
++	byBaas  map[string]uint64
++	byBsDid map[string]uint64
++
++	dirty bool
++}
++
++var (
++	bindingsOnce  sync.Once
++	bindingsTable *bindingTable
++)
++
++// bindingsFile is where the table is stored. Next to accounts.json by default.
++func bindingsFile() string {
++	if v := os.Getenv("NEXTENDO_BINDINGS_FILE"); v != "" {
++		return v
++	}
++	return "nintendo_bindings.json"
++}
++
++// openBindings loads the table once.
++func openBindings() *bindingTable {
++	bindingsOnce.Do(func() {
++		t := &bindingTable{
++			path:     bindingsFile(),
++			Accounts: map[uint64][]NintendoBinding{},
++			byBaas:   map[string]uint64{},
++			byBsDid:  map[string]uint64{},
++		}
++		if b, err := os.ReadFile(t.path); err == nil && len(b) > 0 {
++			if err := json.Unmarshal(b, t); err != nil {
++				// A corrupt table must not take the server down and must not be
++				// silently overwritten: move it aside so it can be inspected.
++				backup := t.path + ".corrupt." + time.Now().UTC().Format("20060102T150405")
++				_ = os.Rename(t.path, backup)
++				log.Printf("[bind] %s illisible (%v) ; déplacé vers %s, on repart à vide", t.path, err, backup)
++				t.Accounts = map[uint64][]NintendoBinding{}
++			}
++		}
++		if t.Accounts == nil {
++			t.Accounts = map[uint64][]NintendoBinding{}
++		}
++		t.reindex()
++		log.Printf("[bind] table des liaisons console : %d compte(s) depuis %s", len(t.Accounts), t.path)
++		bindingsTable = t
++	})
++	return bindingsTable
++}
++
++// reindex rebuilds the reverse indexes. Caller holds the write lock (or is the
++// loader, before the table is shared).
++func (t *bindingTable) reindex() {
++	t.byBaas = map[string]uint64{}
++	t.byBsDid = map[string]uint64{}
++	for pid, list := range t.Accounts {
++		for _, b := range list {
++			if b.BaasID != "" {
++				t.byBaas[b.BaasID] = pid
++			}
++			if b.BsDid != "" {
++				t.byBsDid[b.BsDid] = pid
++			}
++		}
++	}
++}
++
++// persist writes the table. Atomic rename, so a crash mid-write cannot truncate it.
++func (t *bindingTable) persist() error {
++	b, err := json.MarshalIndent(t, "", "  ")
++	if err != nil {
++		return err
++	}
++	tmp := t.path + ".tmp"
++	// 0600: this table maps consoles to players.
++	if err := os.WriteFile(tmp, b, 0o600); err != nil {
++		return err
++	}
++	if err := os.Rename(tmp, t.path); err != nil {
++		return err
++	}
++	t.dirty = false
++	return nil
++}
++
++// Bind records a console identity for an account.
++//
++// Returns whether the binding is new. errBindingTaken when another account owns
++// one of the ids: refusing is the point — a console silently changing owner would
++// be the original bug in a new shape.
++func (t *bindingTable) Bind(pid uint64, b NintendoBinding) (bool, error) {
++	b.BaasID, b.BsDid, b.NaID = normalizeHexID(b.BaasID), normalizeHexID(b.BsDid), normalizeHexID(b.NaID)
++	if pid == 0 || (b.BaasID == "" && b.BsDid == "") {
++		return false, errors.New("bind: pid and at least one id are required")
++	}
++	t.mu.Lock()
++	defer t.mu.Unlock()
++
++	if b.BaasID != "" {
++		if other, taken := t.byBaas[b.BaasID]; taken && other != pid {
++			return false, errBindingTaken
++		}
++	}
++	if b.BsDid != "" {
++		if other, taken := t.byBsDid[b.BsDid]; taken && other != pid {
++			return false, errBindingTaken
++		}
++	}
++
++	now := time.Now().UTC()
++	if b.BoundAt.IsZero() {
++		b.BoundAt = now
++	}
++	b.LastSeen = now
++
++	// Merge into an existing entry for the same console, so a re-link does not
++	// accumulate duplicates.
++	list := t.Accounts[pid]
++	for i := range list {
++		cur := &list[i]
++		if (b.BaasID != "" && cur.BaasID == b.BaasID) || (b.BsDid != "" && cur.BsDid == b.BsDid) {
++			if b.BaasID != "" {
++				cur.BaasID = b.BaasID
++			}
++			if b.BsDid != "" {
++				cur.BsDid = b.BsDid
++			}
++			if b.NaID != "" {
++				cur.NaID = b.NaID
++			}
++			if b.Label != "" {
++				cur.Label = b.Label
++			}
++			cur.LastSeen = now
++			t.Accounts[pid] = list
++			t.reindex()
++			return false, t.persist()
++		}
++	}
++	t.Accounts[pid] = append(list, b)
++	t.reindex()
++	return true, t.persist()
++}
++
++// Unbind removes the binding matching either id from an account.
++func (t *bindingTable) Unbind(pid uint64, baasID, bsDid string) error {
++	baasID, bsDid = normalizeHexID(baasID), normalizeHexID(bsDid)
++	t.mu.Lock()
++	defer t.mu.Unlock()
++
++	list, ok := t.Accounts[pid]
++	if !ok {
++		return ErrNotFound
++	}
++	kept := make([]NintendoBinding, 0, len(list))
++	removed := false
++	for _, b := range list {
++		if (baasID != "" && b.BaasID == baasID) || (bsDid != "" && b.BsDid == bsDid) {
++			removed = true
++			continue
++		}
++		kept = append(kept, b)
++	}
++	if !removed {
++		return ErrNotFound
++	}
++	if len(kept) == 0 {
++		delete(t.Accounts, pid)
++	} else {
++		t.Accounts[pid] = kept
++	}
++	t.reindex()
++	return t.persist()
++}
++
++// Resolve looks a console identity up in the binding table.
++//
++// via is "binding:baas" or "binding:bsdid"; ok is false when nothing matches, and
++// the caller then tries the derived ids (see server.resolveConsole).
++func (t *bindingTable) Resolve(baasID, bsDid string) (pid uint64, via string, ok bool) {
++	baasID, bsDid = normalizeHexID(baasID), normalizeHexID(bsDid)
++	t.mu.RLock()
++	defer t.mu.RUnlock()
++	if baasID != "" {
++		if pid, found := t.byBaas[baasID]; found {
++			return pid, "binding:baas", true
++		}
++	}
++	if bsDid != "" {
++		if pid, found := t.byBsDid[bsDid]; found {
++			return pid, "binding:bsdid", true
++		}
++	}
++	return 0, "", false
++}
++
++// Touch refreshes the LastSeen of a binding, so an operator can tell a live
++// console from an old one. Best-effort: it does not persist on its own (the next
++// real write does), because a console request must never wait on disk.
++func (t *bindingTable) Touch(pid uint64, baasID, bsDid string) {
++	baasID, bsDid = normalizeHexID(baasID), normalizeHexID(bsDid)
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	list := t.Accounts[pid]
++	now := time.Now().UTC()
++	for i := range list {
++		b := &list[i]
++		if (baasID != "" && b.BaasID == baasID) || (bsDid != "" && b.BsDid == bsDid) {
++			b.LastSeen = now
++			t.dirty = true
++			return
++		}
++	}
++}
++
++// resetBindingsForTest drops the loaded table so a test can point the store at a
++// fresh file. Only ever called from tests; a running server loads the table once.
++func resetBindingsForTest() {
++	bindingsOnce = sync.Once{}
++	bindingsTable = nil
++}
++
++// List returns the bindings of an account (for the admin space / support).
++func (t *bindingTable) List(pid uint64) []NintendoBinding {
++	t.mu.RLock()
++	defer t.mu.RUnlock()
++	out := make([]NintendoBinding, len(t.Accounts[pid]))
++	copy(out, t.Accounts[pid])
++	return out
++}
++
++// Count returns how many consoles are bound, for the start-up log.
++func (t *bindingTable) Count() int {
++	t.mu.RLock()
++	defer t.mu.RUnlock()
++	n := 0
++	for _, list := range t.Accounts {
++		n += len(list)
++	}
++	return n
++}
+diff --git a/nintendo_bindings_test.go b/nintendo_bindings_test.go
+new file mode 100644
+index 0000000..4a6e578
+--- /dev/null
++++ b/nintendo_bindings_test.go
+@@ -0,0 +1,371 @@
++package main
++
++// Tests for the console identity bindings and the console presence — the two
++// halves of the Switch friends fix. Both encode rules that are easy to break by
++// accident and expensive to debug in production, which is exactly what happened
++// before: a resolution that quietly fell back to one account, and a presence
++// nobody wrote.
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++// newTestServer builds a server with a temporary JSON store and two accounts.
++func newTestServer(t *testing.T) (*server, *Account, *Account) {
++	t.Helper()
++	if len(sessionSecret) == 0 {
++		sessionSecret = []byte("test-secret-for-bindings")
++	}
++	// The binding table is a sidecar file loaded once per process; point it at a
++	// fresh temp file and reset the loader so each test starts clean.
++	dir := t.TempDir()
++	t.Setenv("NEXTENDO_BINDINGS_FILE", filepath.Join(dir, "nintendo_bindings.json"))
++	resetBindingsForTest()
++	store, err := newJSONStore(filepath.Join(dir, "accounts.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	a, err := store.Create("alice", "alice@example.test", "x")
++	if err != nil {
++		t.Fatal(err)
++	}
++	b, err := store.Create("bob", "bob@example.test", "x")
++	if err != nil {
++		t.Fatal(err)
++	}
++	a.ensureNintendoIDs()
++	b.ensureNintendoIDs()
++	return &server{store: store}, a, b
++}
++
++// call runs an internal endpoint and returns the recorder.
++func call(t *testing.T, h http.HandlerFunc, method, target, body string) *httptest.ResponseRecorder {
++	t.Helper()
++	var r *http.Request
++	if body == "" {
++		r = httptest.NewRequest(method, target, nil)
++	} else {
++		r = httptest.NewRequest(method, target, strings.NewReader(body))
++	}
++	w := httptest.NewRecorder()
++	h(w, r)
++	return w
++}
++
++// decode reads a JSON body.
++func decode(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
++	t.Helper()
++	var out map[string]any
++	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
++		t.Fatalf("body is not JSON (%d): %s", w.Code, w.Body.String())
++	}
++	return out
++}
++
++// TestWhoamiResolvesAnExplicitBinding is the core of the fix: a console that
++// presents ITS OWN ids (not ones derived from a PID) resolves to the account it
++// was bound to.
++func TestWhoamiResolvesAnExplicitBinding(t *testing.T) {
++	s, alice, _ := newTestServer(t)
++
++	// A console that already had a device account: its ids match nothing derived.
++	const consoleBaas = "8ca8d7842f865b2f"
++	const consoleDid = "581ea786a91f1689"
++
++	body := `{"pid":` + pidStr(alice.PID) + `,"baas_id":"` + consoleBaas + `","bs_did":"` + consoleDid + `","label":"switch-1"}`
++	if w := call(t, s.internalBind, http.MethodPost, "/internal/bind", body); w.Code != http.StatusOK {
++		t.Fatalf("bind returned %d: %s", w.Code, w.Body.String())
++	}
++
++	w := call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas="+consoleBaas+"&bsdid="+consoleDid, "")
++	if w.Code != http.StatusOK {
++		t.Fatalf("whoami returned %d: %s", w.Code, w.Body.String())
++	}
++	got := decode(t, w)
++	if pid := uint64(got["pid"].(float64)); pid != alice.PID {
++		t.Errorf("pid = %d, want alice (%d)", pid, alice.PID)
++	}
++	if via, _ := got["via"].(string); via != "binding:baas" {
++		t.Errorf("via = %q, want binding:baas", via)
++	}
++}
++
++// TestWhoamiFailsClosed is the rule that was missing. An unknown console must get
++// 404 — never the first account, never the last one to authenticate.
++func TestWhoamiFailsClosed(t *testing.T) {
++	s, _, _ := newTestServer(t)
++	w := call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas=deadbeefdeadbeef&bsdid=0123456789abcdef", "")
++	if w.Code != http.StatusNotFound {
++		t.Fatalf("whoami returned %d for an unknown console, want 404 (body: %s)", w.Code, w.Body.String())
++	}
++	got := decode(t, w)
++	if found, _ := got["found"].(bool); found {
++		t.Error("whoami claimed to have found an account")
++	}
++	if _, hasPID := got["pid"]; hasPID {
++		t.Error("whoami returned a pid for an unknown console — this is the bug it exists to prevent")
++	}
++}
++
++// TestWhoamiResolvesDerivedIDs keeps the old behaviour working: a console that DID
++// adopt the ids we minted still resolves, without any binding.
++func TestWhoamiResolvesDerivedIDs(t *testing.T) {
++	s, alice, _ := newTestServer(t)
++	w := call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas="+alice.BaasID, "")
++	if w.Code != http.StatusOK {
++		t.Fatalf("whoami returned %d for a derived id: %s", w.Code, w.Body.String())
++	}
++	got := decode(t, w)
++	if pid := uint64(got["pid"].(float64)); pid != alice.PID {
++		t.Errorf("pid = %d, want %d", pid, alice.PID)
++	}
++	if via, _ := got["via"].(string); via != "derived:baas" {
++		t.Errorf("via = %q, want derived:baas", via)
++	}
++}
++
++// TestBindingIsExclusive: binding a console that already belongs to somebody else
++// must be REFUSED, not silently moved. A console quietly changing owner is the
++// original bug in a new shape.
++func TestBindingIsExclusive(t *testing.T) {
++	s, alice, bob := newTestServer(t)
++	const consoleBaas = "1111111111111111"
++
++	if w := call(t, s.internalBind, http.MethodPost, "/internal/bind",
++		`{"pid":`+pidStr(alice.PID)+`,"baas_id":"`+consoleBaas+`"}`); w.Code != http.StatusOK {
++		t.Fatalf("first bind returned %d", w.Code)
++	}
++	w := call(t, s.internalBind, http.MethodPost, "/internal/bind",
++		`{"pid":`+pidStr(bob.PID)+`,"baas_id":"`+consoleBaas+`"}`)
++	if w.Code != http.StatusConflict {
++		t.Fatalf("second bind returned %d, want 409 Conflict", w.Code)
++	}
++
++	// Alice must still own it.
++	got := decode(t, call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas="+consoleBaas, ""))
++	if pid := uint64(got["pid"].(float64)); pid != alice.PID {
++		t.Errorf("the console moved to pid=%d", pid)
++	}
++}
++
++// TestUnbindThenRebind is the documented recovery path for a console that was
++// poisoned by the old fallback: unbind it from the wrong account, bind it to the
++// right one.
++func TestUnbindThenRebind(t *testing.T) {
++	s, alice, bob := newTestServer(t)
++	const consoleBaas = "2222222222222222"
++
++	call(t, s.internalBind, http.MethodPost, "/internal/bind", `{"pid":`+pidStr(alice.PID)+`,"baas_id":"`+consoleBaas+`"}`)
++	if w := call(t, s.internalUnbind, http.MethodPost, "/internal/unbind",
++		`{"pid":`+pidStr(alice.PID)+`,"baas_id":"`+consoleBaas+`"}`); w.Code != http.StatusOK {
++		t.Fatalf("unbind returned %d: %s", w.Code, w.Body.String())
++	}
++	if w := call(t, s.internalBind, http.MethodPost, "/internal/bind",
++		`{"pid":`+pidStr(bob.PID)+`,"baas_id":"`+consoleBaas+`"}`); w.Code != http.StatusOK {
++		t.Fatalf("rebind returned %d: %s", w.Code, w.Body.String())
++	}
++	got := decode(t, call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas="+consoleBaas, ""))
++	if pid := uint64(got["pid"].(float64)); pid != bob.PID {
++		t.Errorf("pid = %d, want bob (%d)", pid, bob.PID)
++	}
++}
++
++// TestBindingAcceptsDecimalIDs: a console presents these ids as 64-bit numbers on
++// some paths (the NEX auth's /api/nsa does), so both spellings must resolve to the
++// same binding.
++func TestBindingAcceptsDecimalIDs(t *testing.T) {
++	s, alice, _ := newTestServer(t)
++	const hexID = "00000000000003e8" // 1000
++	call(t, s.internalBind, http.MethodPost, "/internal/bind", `{"pid":`+pidStr(alice.PID)+`,"baas_id":"`+hexID+`"}`)
++
++	// Same id in decimal.
++	w := call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas=1000", "")
++	if w.Code != http.StatusOK {
++		t.Fatalf("whoami with a decimal id returned %d", w.Code)
++	}
++}
++
++// TestTwoProfilesOnTwoConsoles: two accounts, two consoles, no crosstalk. This is
++// the end state the fix is for — previously both resolved to one account.
++func TestTwoProfilesOnTwoConsoles(t *testing.T) {
++	s, alice, bob := newTestServer(t)
++	call(t, s.internalBind, http.MethodPost, "/internal/bind", `{"pid":`+pidStr(alice.PID)+`,"baas_id":"aaaa000000000001","bs_did":"aaaa000000000002"}`)
++	call(t, s.internalBind, http.MethodPost, "/internal/bind", `{"pid":`+pidStr(bob.PID)+`,"baas_id":"bbbb000000000001","bs_did":"bbbb000000000002"}`)
++
++	first := decode(t, call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas=aaaa000000000001&bsdid=aaaa000000000002", ""))
++	second := decode(t, call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas=bbbb000000000001&bsdid=bbbb000000000002", ""))
++	if uint64(first["pid"].(float64)) != alice.PID || uint64(second["pid"].(float64)) != bob.PID {
++		t.Fatalf("consoles resolved to %v and %v; want %d and %d", first["pid"], second["pid"], alice.PID, bob.PID)
++	}
++	if first["friendCode"] == second["friendCode"] {
++		t.Error("both consoles were served the same friend code — the reported bug")
++	}
++}
++
++// TestConsolePresenceMakesAFriendOnline: resolving a console's identity is proof
++// the console is online, and must publish presence. Without this nothing reports a
++// console that is not inside a NEX game, which is why friends looked offline.
++func TestConsolePresenceMakesAFriendOnline(t *testing.T) {
++	s, alice, _ := newTestServer(t)
++	clearPresence(alice.PID)
++
++	call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas="+alice.BaasID, "")
++
++	p, ok := getPresence(alice.PID)
++	if !ok {
++		t.Fatal("no presence was published for a console that just resolved its identity")
++	}
++	if p.Status != presenceStatusOnline {
++		t.Errorf("status = %d, want %d (online)", p.Status, presenceStatusOnline)
++	}
++	if !consoleIsOnline(alice.PID) {
++		t.Error("consoleIsOnline is false right after a resolution")
++	}
++}
++
++// TestConsolePresenceDoesNotDowngradePlaying: a player IN a game must not be
++// demoted to plain "online" by a console poll.
++func TestConsolePresenceDoesNotDowngradePlaying(t *testing.T) {
++	s, alice, _ := newTestServer(t)
++	setPresence(alice.PID, presenceStatusPlaying, "", "0100c2500fc20000", "")
++
++	call(t, s.internalWhoami, http.MethodGet, "/internal/whoami?baas="+alice.BaasID, "")
++
++	p, _ := getPresence(alice.PID)
++	if p.Status != presenceStatusPlaying {
++		t.Errorf("status = %d, want %d (playing) — a console poll downgraded a game presence", p.Status, presenceStatusPlaying)
++	}
++	if p.AppID != "0100c2500fc20000" {
++		t.Errorf("app id = %q, want the game's", p.AppID)
++	}
++}
++
++// TestInternalPresenceWrite covers the endpoint nx-account calls when the console
++// reports its presence, including the immediate offline.
++func TestInternalPresenceWrite(t *testing.T) {
++	s, alice, _ := newTestServer(t)
++
++	body := `{"pid":` + pidStr(alice.PID) + `,"status":2,"app_id":"0100c2500fc20000","app_field":"YmxvYg=="}`
++	if w := call(t, s.internalPresence, http.MethodPost, "/internal/presence", body); w.Code != http.StatusOK {
++		t.Fatalf("presence write returned %d: %s", w.Code, w.Body.String())
++	}
++	p, ok := getPresence(alice.PID)
++	if !ok || p.Status != presenceStatusPlaying || p.AppField != "YmxvYg==" {
++		t.Fatalf("presence = %+v, ok=%v", p, ok)
++	}
++
++	// status 0 clears it at once, instead of waiting out the TTL.
++	if w := call(t, s.internalPresence, http.MethodPost, "/internal/presence",
++		`{"pid":`+pidStr(alice.PID)+`,"status":0}`); w.Code != http.StatusOK {
++		t.Fatalf("offline write returned %d", w.Code)
++	}
++	if _, ok := getPresence(alice.PID); ok {
++		t.Error("presence survived an explicit offline report")
++	}
++	if consoleIsOnline(alice.PID) {
++		t.Error("consoleIsOnline is still true after an explicit offline report")
++	}
++}
++
++// TestInternalPresenceRejectsUnknownAccount: an unchecked write would let an
++// internal caller fill the presence table with anything.
++func TestInternalPresenceRejectsUnknownAccount(t *testing.T) {
++	s, _, _ := newTestServer(t)
++	if w := call(t, s.internalPresence, http.MethodPost, "/internal/presence", `{"pid":1234567890,"status":1}`); w.Code != http.StatusNotFound {
++		t.Fatalf("returned %d for an unknown account, want 404", w.Code)
++	}
++}
++
++// TestNplnFriendsPublishesFavoritesAndBlocks: Splatoon 3 reads both, and an empty
++// block list lets the game match a player with somebody they blocked.
++func TestNplnFriendsPublishesFavoritesAndBlocks(t *testing.T) {
++	s, alice, bob := newTestServer(t)
++	store := s.store.(*jsonStore)
++
++	if _, _, err := store.SendFriendRequest(alice.ID, bob.PID); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := store.AcceptFriendRequest(bob.ID, alice.PID); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.SetFavorite(alice.ID, bob.PID, true); err != nil {
++		t.Fatal(err)
++	}
++
++	// A third account to block.
++	carol, err := store.Create("carol", "carol@example.test", "x")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := store.BlockUser(alice.ID, carol.PID); err != nil {
++		t.Fatal(err)
++	}
++
++	w := call(t, s.internalNplnFriends, http.MethodGet, "/internal/npln-friends?pid="+pidStr(alice.PID), "")
++	if w.Code != http.StatusOK {
++		t.Fatalf("npln-friends returned %d: %s", w.Code, w.Body.String())
++	}
++	var out struct {
++		UserID  string `json:"user_id"`
++		Friends []struct {
++			PID      uint64 `json:"pid"`
++			UserID   string `json:"user_id"`
++			Favorite bool   `json:"favorite"`
++		} `json:"friends"`
++		Blocked []struct {
++			PID uint64 `json:"pid"`
++		} `json:"blocked"`
++	}
++	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
++		t.Fatal(err)
++	}
++	if out.UserID == "" || !strings.HasPrefix(out.UserID, "u-") {
++		t.Errorf("user_id = %q, want a u- id", out.UserID)
++	}
++	if len(out.Friends) != 1 || out.Friends[0].PID != bob.PID {
++		t.Fatalf("friends = %+v, want just bob", out.Friends)
++	}
++	if !out.Friends[0].Favorite {
++		t.Error("the favorite flag was not published; Splatoon 3 would show the friend unstarred")
++	}
++	if out.Friends[0].UserID == "" {
++		t.Error("the friend has no NPLN user id; the game cannot match it")
++	}
++	if len(out.Blocked) != 1 || out.Blocked[0].PID != carol.PID {
++		t.Errorf("blocked = %+v, want carol", out.Blocked)
++	}
++}
++
++// TestConsolePresenceTTLIsConfigurable guards the knob that trades friend-offline
++// responsiveness against flicker.
++func TestConsolePresenceTTLIsConfigurable(t *testing.T) {
++	t.Setenv("NEXTENDO_CONSOLE_PRESENCE_TTL", "42")
++	if got := consolePresenceTTL(); got != 42*time.Second {
++		t.Errorf("ttl = %s, want 42s", got)
++	}
++	t.Setenv("NEXTENDO_CONSOLE_PRESENCE_TTL", "2m")
++	if got := consolePresenceTTL(); got != 2*time.Minute {
++		t.Errorf("ttl = %s, want 2m", got)
++	}
++}
++
++// itoa keeps the JSON literals above readable.
++func pidStr(v uint64) string {
++	if v == 0 {
++		return "0"
++	}
++	var b [20]byte
++	i := len(b)
++	for v > 0 {
++		i--
++		b[i] = byte('0' + v%10)
++		v /= 10
++	}
++	return string(b[i:])
++}
+diff --git a/npln_friends.go b/npln_friends.go
+index 9c17637..e303777 100644
+--- a/npln_friends.go
++++ b/npln_friends.go
+@@ -43,7 +43,12 @@ type nplnFriendEntry struct {
+ 	UserID     string         `json:"user_id"`
+ 	AccountHex string         `json:"account_hex"`
+ 	Name       string         `json:"name"`
+-	Presence   map[string]any `json:"presence"`
++	// Favorite mirrors the star the player set on this friend. NPLN carries it in
++	// FriendUser.Relationship.favorite, and Splatoon 3 sorts and filters on it —
++	// without it every friend looks unstarred in game while the website shows the
++	// star.
++	Favorite bool           `json:"favorite"`
++	Presence map[string]any `json:"presence"`
+ }
+ 
+ func nplnPresence(pid uint64) map[string]any {
+@@ -86,9 +91,27 @@ func (s *server) internalNplnFriends(w http.ResponseWriter, r *http.Request) {
+ 			UserID:     nplnUserID(fpid),
+ 			AccountHex: nplnAccountHex(fpid),
+ 			Name:       displayName(f),
++			Favorite:   hasFavoritePID(acct, fpid),
+ 			Presence:   nplnPresence(fpid),
+ 		})
+ 	}
++	// Blocked users, in the same shape. NPLN has a Friends.ListBlockingUsers RPC,
++	// and a game that cannot read the block list will happily match a player with
++	// somebody they blocked. Previously not published at all, so the NPLN side had
++	// to answer an empty list.
++	blocked := make([]nplnFriendEntry, 0, len(acct.Blocked))
++	for _, bpid := range acct.Blocked {
++		b, err := s.store.ByPID(bpid)
++		if err != nil {
++			continue
++		}
++		blocked = append(blocked, nplnFriendEntry{
++			PID:        bpid,
++			UserID:     nplnUserID(bpid),
++			AccountHex: nplnAccountHex(bpid),
++			Name:       displayName(b),
++		})
++	}
+ 	writeJSON(w, http.StatusOK, map[string]any{
+ 		"pid":         pid,
+ 		"user_id":     nplnUserID(pid),
+@@ -97,5 +120,6 @@ func (s *server) internalNplnFriends(w http.ResponseWriter, r *http.Request) {
+ 		// Nextendo account (fail-closed identity — same rule as the NEX games).
+ 		"verified": acct.EmailVerified && !acct.Disabled,
+ 		"friends":  friends,
++		"blocked":  blocked,
+ 	})
+ }
+-- 
+2.43.0
+
