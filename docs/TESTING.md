@@ -10,7 +10,7 @@ is the protocol-level view that applies to any client.
 ## 0. Before a console
 
 ```sh
-go build ./cmd/splatoon-3 && go test ./...
+go build ./... && go test ./...
 ```
 
 Then run it locally without TLS and without a real account server, just to see it come up:
@@ -26,8 +26,8 @@ NPLN_LOG_BODIES=1 \
 You should see the tenant line, the schedule line, and the two listeners. Then:
 
 ```sh
-curl -s "http://127.0.0.1:8087/api/health"
-curl -s "http://127.0.0.1:8087/api/stats"        # DASH_TOKEN unset -> open locally
+curl -s "http://127.0.0.1:8088/api/health"
+curl -s "http://127.0.0.1:8088/api/stats"        # DASH_TOKEN unset -> open locally
 ```
 
 ### The bundled smoke test
@@ -115,7 +115,7 @@ Every unimplemented method is logged with its path and a hexdump:
 1. Look the method up in `protocol/proto/…` — the request and response messages are usually there even
    when the wiki has no page for them.
 2. Decode the payload against the request message to confirm which fields the game fills.
-3. Implement it in the matching `internal/services/…` file, register it if the whole service was
+3. Implement it in the matching `npln/services/…` file, register it if the whole service was
    missing, and add a test.
 4. If the response message is `[UNKNOWN]` in the definitions, answer an **empty success** and log it —
    that is what the existing undocumented methods do (`InitializeTag`, `GetViolation`,
@@ -150,7 +150,7 @@ See the checklist at the end of [FRIENDS.md](FRIENDS.md). The single most common
 [friends] ListFriendUsers pid=1800000042 -> 0 friend(s)
 ```
 
-with a friend graph that is fine on the website. `go test ./internal/identity/` proves the derivation
+with a friend graph that is fine on the website. `go test ./npln/identity/` proves the derivation
 matches the account server's, so the difference can only be the secret.
 
 ## 6. Things worth watching over a long session
@@ -167,10 +167,10 @@ matches the account server's, so the difference can only be the secret.
 
 ```sh
 go test ./...                     # everything
-go test ./internal/identity/      # identity + the account-server derivation guard
-go test ./internal/services/matchmaking/   # rooms, tickets, ICE, room codes
-go test ./internal/presence/      # presence hub and its fallbacks
-go test ./internal/services/toyohr/        # schedule slots, etags, fest
+go test ./npln/identity/      # identity + the account-server derivation guard
+go test ./npln/services/matchmaking/   # rooms, tickets, ICE, room codes
+go test ./npln/presence/      # presence hub and its fallbacks
+go test ./npln/services/toyohr/        # schedule slots, etags, fest
 ```
 
 Add a test for every behaviour you discover from a capture. The ones that exist encode decisions that

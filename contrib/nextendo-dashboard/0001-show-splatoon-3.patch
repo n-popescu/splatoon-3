@@ -1,0 +1,79 @@
+From d10193ea3c75810818df5d97cf16446c728d2881 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 17:28:15 +0000
+Subject: [PATCH] dashboard: show Splatoon 3 next to the NEX games
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Splatoon 3 is an NPLN title, not a NEX one, but it serves the same /api/stats
+contract, so the aggregator needs nothing more than a source entry: DASH_S3_URL
+(default http://splatoon3:8088 — Minecraft already has :8087) plus a colour and
+a GAMEINFO row that reports NPLN/gRPC on :443 instead of a NEX version and a
+PRUDP secure port.
+---
+ dashboard_html.go | 9 ++++++---
+ main.go           | 7 ++++++-
+ 2 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/dashboard_html.go b/dashboard_html.go
+index 2efd88a..3437d48 100644
+--- a/dashboard_html.go
++++ b/dashboard_html.go
+@@ -12,7 +12,7 @@ const dashboardHTML = `<!DOCTYPE html>
+ <style>
+   :root{ --bg:#06080f; --bg2:#0c1020; --card:#121830; --card2:#19203c; --line:#26304f; --line2:#33406b;
+          --txt:#eef2ff; --muted:#8b97c4; --faint:#586089;
+-         --mk8:#ff3b4e; --s2:#2ee06a; --ssbu:#ff913b; --acnh:#4aa8e8; --mc:#5d8c3f; --acc:#6aa6ff;
++         --mk8:#ff3b4e; --s2:#2ee06a; --s3:#b4ff39; --ssbu:#ff913b; --acnh:#4aa8e8; --mc:#5d8c3f; --acc:#6aa6ff;
+          --red:#ff3b4e; --blue:#3b8cff; --yellow:#ffce3a; --green:#2ee06a; --purple:#b06bff; --orange:#ff913b; --cyan:#2ad4e6; }
+   *{ box-sizing:border-box; }
+   ::-webkit-scrollbar{ width:10px; height:10px; } ::-webkit-scrollbar-thumb{ background:var(--line2); border-radius:6px; } ::-webkit-scrollbar-track{ background:transparent; }
+@@ -162,14 +162,17 @@ const dashboardHTML = `<!DOCTYPE html>
+ <script>
+   var KEY = location.search || '';
+   var TAB = 'overview';
+-  var GAMECOLORS = { mk8:'#ff3b4e', s2:'#2ee06a', ssbu:'#ff913b', acnh:'#4aa8e8', mc:'#5d8c3f' };
++  var GAMECOLORS = { mk8:'#ff3b4e', s2:'#2ee06a', s3:'#b4ff39', ssbu:'#ff913b', acnh:'#4aa8e8', mc:'#5d8c3f' };
+   // correct per-game identity (the shared MK8 dashboard mislabels S2/SSBU host/port/NEX)
+   var GAMEINFO = {
+     mk8:{ nex:'4.3.3', sni:'the-game-host', port:60003 },
+     s2:{  nex:'4.0.0', sni:'the-game-host', port:60004 },
+     ssbu:{nex:'4.6.3', sni:'the-game-host', port:60005 },
+     acnh:{nex:'4.0.0', sni:'the-game-host', port:60007 },
+-    mc:{  nex:'4.3.1', sni:'the-game-host', port:60006 }
++    mc:{  nex:'4.3.1', sni:'the-game-host', port:60006 },
++    // Splatoon 3 speaks NPLN (gRPC over HTTP/2 on :443 behind the SNI router),
++    // so it has no NEX version and no PRUDP secure port to show.
++    s3:{  nex:'NPLN (gRPC)', sni:'the-npln-host', port:443 }
+   };
+   // Real game mode per lobby. S2 encodes it in the MatchmakeSession game_mode (+ maxParticipants
+   // and the private-room code): mode 1 = Ranked, mode 0 = Turf War (confirmed in-game), a
+diff --git a/main.go b/main.go
+index 055f4bc..cfcb294 100644
+--- a/main.go
++++ b/main.go
+@@ -29,7 +29,7 @@ var worldMapJPG []byte
+ // ---- game sources ----------------------------------------------------------
+ 
+ type gameSrc struct {
+-	Key   string // "mk8" | "s2" | "ssbu" | "acnh"
++	Key   string // "mk8" | "s2" | "s3" | "ssbu" | "acnh" | "mc"
+ 	Label string
+ 	Color string // accent hex used by the UI
+ 	URL   string // base URL of that game's dashboard (…/api/stats appended)
+@@ -56,6 +56,11 @@ func sources() []gameSrc {
+ 			URL: envOr("DASH_ACNH_URL", "http://localhost:8086"), Token: envOr("DASH_ACNH_TOKEN", tok)},
+ 		{Key: "mc", Label: "Minecraft", Color: "#5d8c3f",
+ 			URL: envOr("DASH_MC_URL", "http://minecraft:8087"), Token: envOr("DASH_MC_TOKEN", tok)},
++		// Splatoon 3 is an NPLN title, not a NEX one: it serves the same
++		// /api/stats contract, so nothing here has to know the difference.
++		// :8088 because Minecraft already has :8087.
++		{Key: "s3", Label: "Splatoon 3", Color: "#b4ff39",
++			URL: envOr("DASH_S3_URL", "http://splatoon3:8088"), Token: envOr("DASH_S3_TOKEN", tok)},
+ 	}
+ }
+ 
+-- 
+2.43.0
+

@@ -7,8 +7,8 @@
 package friendsv1
 
 import (
-	_ "github.com/n-popescu/splatoon-3/gen/npln/common"
-	_ "github.com/n-popescu/splatoon-3/gen/third_party/googleapi"
+	_ "github.com/NextendoNetwork/splatoon-3/gen/npln/common"
+	_ "github.com/NextendoNetwork/splatoon-3/gen/third_party/googleapi"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"

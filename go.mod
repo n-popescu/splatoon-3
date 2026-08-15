@@ -1,4 +1,4 @@
-module github.com/n-popescu/splatoon-3
+module github.com/NextendoNetwork/splatoon-3
 
 go 1.23.0
 
