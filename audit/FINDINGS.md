@@ -449,3 +449,138 @@ shared concerns into `nextendo-nex`, which every game server already imports:
 
 That would delete roughly 200 duplicated lines per game server and make this class of finding
 impossible rather than merely fixed.
+
+---
+
+# Round two
+
+A second pass, after the first set of fixes, over the areas the first pass only skimmed: the code that
+parses whatever a client sends, the OAuth and session flows, the dashboards' HTML, and the boundaries
+where one bad message could affect more than one player. **Three more findings, all fixed** — and a list
+of things that turned out to be sound, which is worth as much as a finding.
+
+---
+
+## F15 — `nextendo-nex`: fragment reassembly is unbounded (remote memory exhaustion)
+
+**Severity: High (one client can kill a game server, dropping every player).** Fixed by `patches/05`.
+
+`processData` only dispatches a message when a fragment arrives with `FragmentID == 0`:
+
+```go
+// nextendo-nex/endpoint.go:561
+c.fragBuf = append(c.fragBuf, p.Payload...)
+if p.FragmentID == 0 {
+	full := c.fragBuf
+	c.fragBuf = nil
+	c.dispatchRMC(full)
+}
+```
+
+So a peer that keeps sending fragments and never terminates the message grows `fragBuf` for as long as
+it likes. The per-packet payload is bounded by the 16-bit length field in the PRUDP header — but the
+*number of fragments* was not bounded by anything. A few thousand packets is a gigabyte; the process
+dies, and it takes **every player in every lobby on that server** with it, not just the connection that
+did it.
+
+Reaching this needs a completed handshake, but the handshake only proves knowledge of the game's access
+key, which is a public per-title value. Any player — or anything that can speak PRUDP-Lite to the
+secure port — can do it, and a merely *buggy* client causes the same outage by accident.
+
+**The fix:** cap one reassembled message at 1 MiB (`NEXTENDO_MAX_MESSAGE_BYTES`, and values under 64 KiB
+are ignored so a typo cannot break a legitimate payload). That is two orders of magnitude above the
+largest real message — SSBU's DataStore init, the biggest thing on the wire, is ~16 KB. A peer that
+exceeds it has its connection closed rather than being handed a truncated message, because a
+half-message reaching a handler is a worse failure than a disconnect.
+
+---
+
+## F16 — `nextendo-nex`: no panic containment, so one malformed message kills every session
+
+**Severity: Medium-High (blast radius).** Fixed by `patches/05`.
+
+There was **no `recover()` anywhere** in the package. Every RMC handler parses bytes a client chose, and
+each game server registers a dozen of them, written against a protocol that is still being
+reverse-engineered — this repository's own Splatoon 3 work turned up several methods whose response
+shape nobody has documented. One out-of-range index in any of them takes the **process** down.
+
+The cost of that is asymmetric. The player who sent the bad message deserves an error; the forty players
+mid-match on the same server do not deserve a disconnect, and the operator gets a stack trace with no
+indication of which console caused it.
+
+To be fair to the code: I went looking for a reachable panic and did **not** find one. The raw-indexing
+sites are all guarded — `tournament.go:266` checks `len(req.Body) < 5` and validates the announced length
+against the body, `ranking_board.go:230` checks `< 13` before reading at offset 5, and Luigi's Mansion 3's
+hand-written `parsePublishedState` bounds every step. That is better than most protocol code. The finding
+is that *nothing catches the next one*.
+
+**The fix:** a recover barrier around each handler call. The panic is logged with its stack, the caller
+gets an RMC error, and the connection keeps working — with a test asserting a following request on the
+same connection still succeeds.
+
+---
+
+## F17 — `nextendo-nex`: list pre-allocation amplifies a request into a much larger allocation
+
+**Severity: Low-Medium.** Fixed by `patches/05`.
+
+`ReadList` and `ReadMap` correctly reject a count larger than the remaining bytes. But a large
+*legitimate* message can still announce millions of elements, and:
+
+```go
+out := make([]T, 0, n)     // n up to Remaining()
+```
+
+allocates `n * sizeof(T)`. For an 8-byte element that is 8× the message; for a struct element, much
+more. The loop also kept calling the element reader on an exhausted stream, appending `n` zero values.
+
+**The fix:** cap the pre-allocation at 1024 elements (growth from there costs a few copies) and stop the
+loop at the first element that fails to decode.
+
+---
+
+## F18 — Also fixed while here (previously documented as F12)
+
+- **`nx-dauth`** now bounds both request bodies (1 MiB). They were `io.ReadAll` with no limit on a public
+  `:443`, and this is the service every console talks to **first**, so exhausting it blocks logins
+  network-wide. `patches/06`.
+- **`mario-strikers`** now writes its club store atomically (temp file + rename, mode `0600`). It was
+  the one persistent store in the fleet written with a plain `os.WriteFile`, so a crash mid-write
+  silently destroyed players' club data. `patches/07`.
+
+---
+
+## Checked in round two and sound
+
+Recording these so nobody spends the time again.
+
+- **OAuth (`nextendo-account/oauth.go`, 724 lines)** is correct on the points that usually go wrong:
+  authorization codes are single-use with a short TTL and are bound to their client *and* redirect URI;
+  PKCE is **mandatory** for public clients and verified with SHA-256; `redirect_uri` is matched exactly
+  against the registered list (loopback-only for the emulator client, per RFC 8252); client secrets are
+  bcrypt-compared; client registration is admin-gated; and the consent page escapes what it renders. The
+  deny path in the page's JavaScript reuses `redirect_uri` from the query string, which would be an open
+  redirect — except the page is only served after the URI has been validated, so it is not.
+- **The dashboards do not have an XSS.** Every string field that reaches HTML goes through `esc()`
+  (`city`, `isp`, `mode`, `natType`, `state`, `action`, `accessKey`, labels); the unescaped values are
+  numeric. Player names are derived server-side (`Joueur-%d`), not taken from account data.
+- **`StreamIn` is bounds-safe by construction**: an underflow records an error and every subsequent read
+  returns a zero value, so a decode path can run to completion and be validated once at the end. This is
+  the right design for a parser fed by an untrusted peer, and it is why F16 found no reachable panic.
+- **PRUDP-Lite framing is bounded**: `DecodePackets` refuses a bad magic byte, waits for a complete
+  packet rather than reading past the buffer, and `decodeLiteOptions` validates every option header and
+  value length.
+- **The raw-indexing sites in the tournament, ranking and friend-state parsers are all guarded** (see
+  F16).
+
+---
+
+## Round-two patch index
+
+| Patch | Repository | Fixes |
+| --- | --- | --- |
+| `05-nextendo-nex-reassembly-limit-panic-containment.patch` | `nextendo-nex` | F15, F16, F17 |
+| `06-nx-dauth-bound-request-bodies.patch` | `nx-dauth` | F18 |
+| `07-mario-strikers-atomic-club-store.patch` | `mario-strikers` | F18 |
+
+`05` applies on top of `01` (both touch `nextendo-nex`); apply them in order.

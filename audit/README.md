@@ -1,8 +1,8 @@
 # Nextendo Network — cross-repository audit
 
 An audit of every repository in the [NextendoNetwork](https://github.com/orgs/NextendoNetwork/repositories)
-organisation, done while building the Splatoon 3 server: **13 findings**, of which **8 are fixed** by
-the patches in [`patches/`](patches) and 5 are documented with a recommendation.
+organisation, done while building the Splatoon 3 server. Two passes so far: **18 findings**, of which
+**12 are fixed** by the patches in [`patches/`](patches), the rest documented with a recommendation.
 
 Two of the fixes are for defects that were actively breaking gameplay and identity across the whole
 fleet:
@@ -44,6 +44,10 @@ it belongs — nothing here depends on the location.
 | F11 | Low-Med | all game servers | `NEXTENDO_REQUIRE_ACCOUNT` defaults **off** (anonymous logins) | documented |
 | F12 | Low | `nx-dauth`, `mario-strikers` | Unbounded request bodies; non-atomic write of persistent state | documented |
 | F13 | Low | tooling | A test that cannot pass in a clean checkout; `go vet` warning; two repos need a newer Go than the docs claim | documented |
+| F15 | **High** | `nextendo-nex` | Fragment reassembly unbounded: one client can exhaust a game server's memory | **fixed** |
+| F16 | Med-High | `nextendo-nex` | No panic containment: one malformed message killed the process, i.e. every player | **fixed** |
+| F17 | Low-Med | `nextendo-nex` | List pre-allocation amplifies a request into a much larger allocation | **fixed** |
+| F18 | Low | `nx-dauth`, `mario-strikers` | Unbounded request bodies; non-atomic club store (F12, now patched) | **fixed** |
 
 ## Applying the patches
 
@@ -66,6 +70,9 @@ and the router (`03`).
 | `02-nextendo-nncs-atomic-writes-and-bounded-tables.patch` | `nextendo-nncs` |
 | `03-sni-router-proxy-protocol-and-connection-hygiene.patch` | `sni-router` |
 | `04-nx-scsi-signed-blob-urls-ownership-and-limits.patch` | `nx-scsi` |
+| `05-nextendo-nex-reassembly-limit-panic-containment.patch` | `nextendo-nex` (apply after `01`) |
+| `06-nx-dauth-bound-request-bodies.patch` | `nx-dauth` |
+| `07-mario-strikers-atomic-club-store.patch` | `mario-strikers` |
 | `10-splatoon-2-revoke-leaked-token.patch` | `splatoon-2` |
 | `11-mario-kart-8-deluxe-presence-and-revocation-loader.patch` | `mario-kart-8-deluxe` |
 | `12-super-smash-bros-ultimate-presence-and-revocation.patch` | `super-smash-bros-ultimate` |
@@ -84,6 +91,7 @@ The `nextendo-account` friends/identity fix is a separate series in
 | Variable | Repository | Meaning |
 | --- | --- | --- |
 | `NEXTENDO_REVOKED_TOKENS` / `_FILE` | every game server + account | Revoke a leaked token by configuration instead of nine source edits |
+| `NEXTENDO_MAX_MESSAGE_BYTES` | `nextendo-nex` | Cap on one reassembled RMC message (default 1 MiB) |
 | `SNI_SEND_PROXY_PROTOCOL=1` | `sni-router` | Send PROXY v1 to the backends (pair with `NEXTENDO_PROXY_PROTOCOL=1`) |
 | `SCSI_URL_KEY` | `nx-scsi` | HMAC key for blob URLs (generated into the data dir if unset) |
 | `SCSI_MAX_BLOB_BYTES` | `nx-scsi` | Upload cap, default 64 MiB |
@@ -103,6 +111,12 @@ The `nextendo-account` friends/identity fix is a separate series in
   [FINDINGS.md](FINDINGS.md)).
 
 ## What was checked and is fine
+
+Round two adds: the OAuth flow (single-use codes, mandatory PKCE for public clients, exact
+`redirect_uri` matching, bcrypt secrets, admin-gated registration, escaped consent page), the dashboards'
+HTML escaping, `StreamIn`'s bounds safety, PRUDP-Lite framing, and the hand-written parsers in the
+tournament, ranking and friend-state paths — all sound. Detail at the end of
+[FINDINGS.md](FINDINGS.md).
 
 Worth recording, so nobody re-audits it:
 
