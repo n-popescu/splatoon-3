@@ -26,6 +26,36 @@ curl -s "http://127.0.0.1:8087/api/health"
 curl -s "http://127.0.0.1:8087/api/stats"        # DASH_TOKEN unset -> open locally
 ```
 
+### The bundled smoke test
+
+`cmd/npln-smoke` talks to a running server over real gRPC and asserts the things that must hold before
+a console is worth trying. Unit tests cannot catch a broken interceptor chain or a codec problem; this
+does, in two seconds:
+
+```sh
+# terminal 1
+NPLN_DISABLE_TLS=1 NPLN_LISTEN_ADDR=127.0.0.1:50051 NEXTENDO_SECRET=dev-secret ./splatoon-3
+# terminal 2
+go run ./cmd/npln-smoke -addr 127.0.0.1:50051
+```
+
+```
+  ok   a request without npln-tenant-id is refused
+  ok   anonymous token issued for tenants/t-dce9377b-lp1/users/u-anonymous
+  ok   the anonymous user is refused by Friends
+  ok   schedule: 12 contiguous slots, current one 16:00..18:00, regular stages [5 6]
+  ok   a console that resolves to no Nextendo account is refused
+```
+
+The last check is the important one: it is the invariant the Switch friend bug came from — a server that
+answers "some account" instead of an error lets one console act as another player.
+
+With a real `nx2.` token from your account server you can also drive a full login:
+
+```sh
+go run ./cmd/npln-smoke -addr 127.0.0.1:50051 -nnex "nx2.…" -nsa "<the account's baas id>"
+```
+
 `grpcurl` is the fastest way to poke at it without a console. The server has no reflection service (the
 console never asks for one), so pass the vendored protos:
 
