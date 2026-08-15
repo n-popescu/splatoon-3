@@ -1,0 +1,92 @@
+
+syntax = "proto3";
+
+package nn.npln.ugcstore.v1;
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "proto/common/value.proto";
+import "proto/ugcstore/v1/resources.proto";
+
+enum ServerValueType {
+	SERVER_VALUE_TYPE_UNSPECIFIED = 0;
+	REQUEST_TIME = 1;
+}
+
+message FieldTransform {
+	string field_path = 1;
+	oneof transform_type {
+		ServerValueType set_server_value = 2;
+		nn.npln.common.Value increment = 3;
+		nn.npln.common.Value maximum = 4;
+		nn.npln.common.Value minimum = 5;
+		nn.npln.common.Value buffered_increment = 6; // Removed in 1.46.0
+	}
+}
+
+message BufferedFieldTransform {
+	string field_path = 1;
+	oneof transform_type {
+		nn.npln.common.Value increment = 2;
+	}
+}
+
+message Precondition {
+	oneof condition_type {
+		bool exists = 1;
+		google.protobuf.Timestamp update_time = 2;
+	}
+}
+
+message UpdateDocumentRequest {
+	Document document = 1;
+	google.protobuf.FieldMask update_mask = 2;
+	Precondition current_document = 3;
+}
+
+message DeleteDocumentRequest {
+	string name = 1;
+	Precondition current_document = 2;
+}
+
+message SetAttachmentRequest {
+	string parent = 1;
+	bytes body = 2;
+	oneof precondition {
+		bool exists = 3;
+	}
+	string mime_type = 4;
+}
+
+message UnsetAttachmentRequest {
+	string parent = 1;
+	bool force = 3;
+}
+
+message ImportAttachmentRequest {
+	string parent = 1;
+	string uri = 2;
+	string mime_type = 3;
+}
+
+message TransformDocumentRequest {
+	string name = 1;
+	repeated FieldTransform field_transforms = 2;
+	repeated BufferedFieldTransform buffered_field_transforms = 3;
+}
+
+message WriteOperation {
+	oneof operation_type {
+		UpdateDocumentRequest update_document = 1;
+		DeleteDocumentRequest delete_document = 2;
+		TransformDocumentRequest transform_document = 6;
+		SetAttachmentRequest set_attachment = 3;
+		UnsetAttachmentRequest unset_attachment = 4;
+		ImportAttachmentRequest import_attachment = 5;
+	}
+}
+
+message WriteResult {
+	google.protobuf.Timestamp update_time = 1;
+	repeated nn.npln.common.Value transform_results = 2;
+}

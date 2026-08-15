@@ -1,0 +1,136 @@
+
+syntax = "proto3";
+
+package nn.npln.ugcstore.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+import "proto/common/value.proto";
+import "proto/ugcstore/v1/query.proto";
+import "proto/ugcstore/v1/resources.proto";
+import "proto/ugcstore/v1/write.proto";
+
+message GetDocumentRequest {
+	string name = 1;
+	google.protobuf.FieldMask read_mask = 2;
+	nn.npln.common.MapValue rule_context = 3;
+}
+
+message BulkGetDocumentsRequest {
+	string parent = 1;
+	repeated string names = 2;
+	google.protobuf.FieldMask read_mask = 3;
+	nn.npln.common.MapValue rule_context = 4;
+}
+
+message BulkGetDocumentsResponse {
+	oneof result {
+		Document found = 1;
+		string missing = 2;
+	}
+	google.protobuf.Timestamp read_time = 4;
+}
+
+message RunQueryRequest {
+	string parent = 1;
+	oneof query_type {
+		StructuredQuery structured_query = 2;
+	}
+	nn.npln.common.MapValue rule_context = 3;
+}
+
+message RunQueryResponse {
+	Document document = 1;
+	google.protobuf.Timestamp read_time = 3;
+	int32 skipped_results = 4;
+}
+
+message CommitDocumentsRequest {
+	string tenant = 1;
+	repeated WriteOperation write_operations = 2;
+	nn.npln.common.MapValue rule_context = 3;
+}
+
+message CommitDocumentsResponse {
+	repeated WriteResult write_results = 1;
+	google.protobuf.Timestamp commit_time = 2;
+}
+
+message IssueAttachmentUriRequest {
+	string parent = 1;
+	oneof expiration {
+		google.protobuf.Timestamp expire_time = 2;
+		google.protobuf.Duration ttl = 3;
+	}
+	nn.npln.common.MapValue rule_context = 4;
+}
+
+message IssueAttachmentUriResponse {
+	string uri = 1;
+}
+
+message BulkIssueAttachmentUriRequest {
+	repeated IssueAttachmentUriRequest requests = 1;
+	bool allow_missing = 2;
+}
+
+message BulkIssueAttachmentUriResponse {
+	repeated string uri = 1;
+	repeated BulkIssueAttachmentUriResult results = 2;
+}
+
+message BulkIssueAttachmentUriResult {
+	oneof result {
+		string uri = 1;
+		string missing = 2;
+	}
+}
+
+message IssueUploadUriRequest {
+	string tenant = 1;
+	bool resumable = 2;
+}
+
+message IssueUploadUriResponse {
+	string uri = 1;
+}
+
+message CreateDocumentShortAliasRequest {
+	string parent = 1;
+	DocumentShortAlias document_short_alias = 2;
+	nn.npln.common.MapValue rule_context = 3;
+}
+
+message GetDocumentShortAliasRequest {
+	string name = 1;
+}
+
+message BulkGetDocumentShortAliasesRequest {
+	repeated GetDocumentShortAliasRequest requests = 1;
+}
+
+message BulkGetDocumentShortAliasesResponse {
+	repeated BulkGetDocumentShortAliasesResult results = 1;
+}
+
+message BulkGetDocumentShortAliasesResult {
+	oneof result {
+		DocumentShortAlias found = 1;
+		string missing = 2;
+	}
+}
+
+service Ugcstore {
+	rpc GetDocument(GetDocumentRequest) returns (Document);
+	rpc BulkGetDocuments(BulkGetDocumentsRequest) returns (stream BulkGetDocumentsResponse);
+	rpc RunQuery(RunQueryRequest) returns (stream RunQueryResponse);
+	rpc CommitDocuments(CommitDocumentsRequest) returns (CommitDocumentsResponse);
+	rpc IssueAttachmentUri(IssueAttachmentUriRequest) returns (IssueAttachmentUriResponse);
+	rpc BulkIssueAttachmentUri(stream IssueAttachmentUriRequest) returns (stream IssueAttachmentUriResponse);
+	rpc IssueUploadUri(IssueUploadUriRequest) returns (IssueUploadUriResponse);
+	rpc CreateDocumentShortAlias(CreateDocumentShortAliasRequest) returns (DocumentShortAlias);
+	rpc GetDocumentShortAlias(GetDocumentShortAliasRequest) returns (DocumentShortAlias);
+	rpc BulkGetDocumentShortAliases(BulkGetDocumentShortAliasesRequest) returns (BulkGetDocumentShortAliasesResponse);
+}

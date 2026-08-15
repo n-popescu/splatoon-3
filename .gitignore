@@ -1,0 +1,10 @@
+# build output
+/splatoon-3
+*.exe
+
+# runtime state and secrets — never commit these
+/.env
+/data/
+/schedule.json
+/*.pem
+/nextendo_secret.key

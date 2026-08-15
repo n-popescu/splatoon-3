@@ -1,0 +1,77 @@
+
+syntax = "proto3";
+
+package nn.npln.toyohr.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "proto/toyohr/v1/resources.proto";
+
+message SelectVsParamsRequest {
+	string target = 1;
+	string etag = 2;
+	google.protobuf.Timestamp current_time = 3;
+	int32 vs_params_count = 4;
+}
+
+message SelectVsParamsResponse {
+	bool unk = 1;
+	VsParams params = 2;
+	string etag = 3;
+}
+
+message SelectVsSchedulesRequest {
+	string target = 1;
+	string etag = 2;
+	google.protobuf.Timestamp current_time = 3;
+	google.protobuf.Duration select_duration = 4;
+}
+
+message SelectVsSchedulesResponse {
+	bool unk = 1;
+	repeated VsSchedule schedules = 2;
+	string etag = 3;
+}
+
+message SelectCoopSchedulesRequest {
+	string target = 1;
+	string etag = 2;
+	google.protobuf.Timestamp current_time = 3;
+}
+
+message SelectCoopSchedulesResponse {
+	bool unk = 1;
+	repeated CoopSchedule schedules = 2;
+	string etag = 3;
+}
+
+message SelectSeasonSchedulesRequest {
+	string tenant = 1;
+	string etag = 2;
+	google.protobuf.Timestamp current_time = 3;
+	int32 season_schedule_count = 4;
+	string target = 5;
+}
+
+message SelectSeasonSchedulesResponse {
+	bool unk = 1;
+	repeated SeasonSchedule schedules = 2;
+	string etag = 3;
+}
+
+message SelectLeagueSchedulesRequest {
+    string target = 1;
+    google.protobuf.Timestamp current_time = 2;
+}
+
+message SelectLeagueSchedulesResponse {
+    repeated LeagueSchedule schedules = 1;
+}
+
+service Schedule {
+	rpc SelectVsParams(SelectVsParamsRequest) returns (SelectVsParamsResponse);
+	rpc SelectVsSchedules(SelectVsSchedulesRequest) returns (SelectVsSchedulesResponse);
+	rpc SelectCoopSchedules(SelectCoopSchedulesRequest) returns (SelectCoopSchedulesResponse);
+	rpc SelectSeasonSchedules(SelectSeasonSchedulesRequest) returns (SelectSeasonSchedulesResponse);
+	rpc SelectLeagueSchedules(SelectLeagueSchedulesRequest) returns (SelectLeagueSchedulesResponse);
+}
