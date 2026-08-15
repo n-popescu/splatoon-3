@@ -9,7 +9,7 @@ BINARY  ?= splatoon-3
 .PHONY: build test vet run smoke generate tidy clean
 
 build:
-	$(GO) build -o $(BINARY) ./cmd/splatoon-3
+	$(GO) build -o $(BINARY) .
 
 test:
 	$(GO) test ./...

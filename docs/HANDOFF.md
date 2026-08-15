@@ -13,12 +13,12 @@ Merged as six reviewed pull requests:
 
 | PR | Contents |
 | --- | --- |
-| [#1](https://github.com/n-popescu/splatoon-3/pull/1) | NPLN `.proto` tree (vendored verbatim from kinnay/NPLN-Protocols `e55caa5`) + generated Go bindings + `scripts/generate.sh` |
-| [#2](https://github.com/n-popescu/splatoon-3/pull/2) | config, identity chain, ES256 tokens, `nextendo-account` client, gRPC plumbing |
-| [#3](https://github.com/n-popescu/splatoon-3/pull/3) | `Auth`, `UserService`, `Friends`, `PresenceService`, the presence hub, `docs/FRIENDS.md` |
-| [#4](https://github.com/n-popescu/splatoon-3/pull/4) | `GameSessionService`, `Matchmaker`, ICE, `Messaging`, `LobbyMessaging`, `MaintenanceScheduleService` |
-| [#5](https://github.com/n-popescu/splatoon-3/pull/5) | `Schedule`, `FestService`, `CloudSave`, `GameRecord`, `Replay`/`Locker`/`Canola`/`CoopScenario`, `UserScreening`, `Ugcstore` |
-| [#6](https://github.com/n-popescu/splatoon-3/pull/6) | the binary, service wiring, `/api/stats`, `example.env`, deployment + testing docs |
+| [#1](https://github.com/NextendoNetwork/splatoon-3/pull/1) | NPLN `.proto` tree (vendored verbatim from kinnay/NPLN-Protocols `e55caa5`) + generated Go bindings + `scripts/generate.sh` |
+| [#2](https://github.com/NextendoNetwork/splatoon-3/pull/2) | config, identity chain, ES256 tokens, `nextendo-account` client, gRPC plumbing |
+| [#3](https://github.com/NextendoNetwork/splatoon-3/pull/3) | `Auth`, `UserService`, `Friends`, `PresenceService`, the presence hub, `docs/FRIENDS.md` |
+| [#4](https://github.com/NextendoNetwork/splatoon-3/pull/4) | `GameSessionService`, `Matchmaker`, ICE, `Messaging`, `LobbyMessaging`, `MaintenanceScheduleService` |
+| [#5](https://github.com/NextendoNetwork/splatoon-3/pull/5) | `Schedule`, `FestService`, `CloudSave`, `GameRecord`, `Replay`/`Locker`/`Canola`/`CoopScenario`, `UserScreening`, `Ugcstore` |
+| [#6](https://github.com/NextendoNetwork/splatoon-3/pull/6) | the binary, service wiring, `/api/stats`, `example.env`, deployment + testing docs |
 
 `go build ./...`, `go vet ./...` and `go test ./...` all pass. **It has never seen the game.**
 
@@ -75,15 +75,15 @@ Ordered by how likely it is to block a match.
 
 | # | Item | Why it is open | Where |
 | --- | --- | --- | --- |
-| 1 | **Matchmaking config names and player counts** | Nintendo configures them server-side; the game never says. Defaults (min 2 / max 8) let two people match but are wrong for 4v4. | `data/matchmaking.json`, `internal/services/matchmaking/config.go` |
-| 2 | **Schedule content** | Stage/rule/weapon ids are game data. A structurally valid placeholder ships; the numbers are guesses. | `schedule.json`, `internal/services/toyohr/schedule.go` |
-| 3 | **The `host`/`port` contract** | The host publishes its address through `SyncGameSession` and joiners read it back. That is the only defensible design without a capture, but the *actual* field the game fills (address vs ICE candidate) needs confirming. | `internal/services/matchmaking/registry.go` |
-| 4 | **Undocumented RPCs** | `InitializeTag`, `GetTag`, `SelectTags`, `GetViolation`, `ValidateSaveRecord` have `[UNKNOWN]` response bodies upstream. They answer an empty success **and log it**. | `internal/services/toyohr/record.go` |
-| 5 | **Splatfest results** | Served `is_valid: false` on purpose. Real results need a fest-power pipeline nobody has specified. | `internal/services/toyohr/fest.go` |
+| 1 | **Matchmaking config names and player counts** | Nintendo configures them server-side; the game never says. Defaults (min 2 / max 8) let two people match but are wrong for 4v4. | `data/matchmaking.json`, `npln/services/matchmaking/config.go` |
+| 2 | **Schedule content** | Stage/rule/weapon ids are game data. A structurally valid placeholder ships; the numbers are guesses. | `schedule.json`, `npln/services/toyohr/schedule.go` |
+| 3 | **The `host`/`port` contract** | The host publishes its address through `SyncGameSession` and joiners read it back. That is the only defensible design without a capture, but the *actual* field the game fills (address vs ICE candidate) needs confirming. | `npln/services/matchmaking/registry.go` |
+| 4 | **Undocumented RPCs** | `InitializeTag`, `GetTag`, `SelectTags`, `GetViolation`, `ValidateSaveRecord` have `[UNKNOWN]` response bodies upstream. They answer an empty success **and log it**. | `npln/services/toyohr/record.go` |
+| 5 | **Splatfest results** | Served `is_valid: false` on purpose. Real results need a fest-power pipeline nobody has specified. | `npln/services/toyohr/fest.go` |
 | 6 | **Rank-aware matchmaking** | Property *equality* filtering works; rank lives in an opaque property. Once you know which one, a band filter is a few lines. | `QueryFilter` in `registry.go` |
 | 7 | **Query cursors** | `page_size` is honoured; `page_token` / UGC cursors are not, and say so in the log. | `ugcstore.go`, `gamesession.go` |
 | 8 | **`nx-account` changes** | Not a public repository, so it could not be edited. Six steps, two of which actually kill the friend bug. | [`FRIENDS.md`](FRIENDS.md) §B |
-| 9 | **Latency-based matching** | Latency data arrives and is stored on the user session; nothing uses it. Fine for one region. | `internal/services/matchmaking` |
+| 9 | **Latency-based matching** | Latency data arrives and is stored on the user session; nothing uses it. Fine for one region. | `npln/services/matchmaking` |
 
 ---
 
@@ -166,8 +166,8 @@ Ordered by how likely it is to block a match.
   room returns the *specific* full code, that a heartbeat does not clear presence attributes, that an
   unresolvable console fails closed, that the NPLN user id matches `nextendo-account`'s derivation. If
   you change behaviour, one of these will tell you which decision you just reversed.
-- **The identity derivation is a two-body problem.** `internal/identity` and `nextendo-account`'s
-  `npln_friends.go` must agree forever. `internal/identity/identity_test.go` re-implements the account
+- **The identity derivation is a two-body problem.** `npln/identity` and `nextendo-account`'s
+  `npln_friends.go` must agree forever. `npln/identity/identity_test.go` re-implements the account
   server's version rather than calling ours twice, on purpose.
 - **Streams are the silent failure mode.** Every long-lived stream here sends something on a timer. If a
   feature works for 60 seconds and then stops, look at the stream's heartbeat before anything else.

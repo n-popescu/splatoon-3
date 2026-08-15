@@ -24,7 +24,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-MODULE="github.com/n-popescu/splatoon-3"
+MODULE="github.com/NextendoNetwork/splatoon-3"
 OUT="gen"
 INCLUDE="protocol"
 

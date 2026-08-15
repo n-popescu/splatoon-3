@@ -7,8 +7,8 @@
 package hydrov1
 
 import (
-	common "github.com/n-popescu/splatoon-3/gen/npln/common"
-	googlerpc "github.com/n-popescu/splatoon-3/gen/third_party/googlerpc"
+	common "github.com/NextendoNetwork/splatoon-3/gen/npln/common"
+	googlerpc "github.com/NextendoNetwork/splatoon-3/gen/third_party/googlerpc"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"

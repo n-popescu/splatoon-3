@@ -7,10 +7,10 @@
 package gamesyncv1
 
 import (
-	common "github.com/n-popescu/splatoon-3/gen/npln/common"
-	_ "github.com/n-popescu/splatoon-3/gen/third_party/googleapi"
-	googlerpc "github.com/n-popescu/splatoon-3/gen/third_party/googlerpc"
-	_ "github.com/n-popescu/splatoon-3/gen/third_party/validate"
+	common "github.com/NextendoNetwork/splatoon-3/gen/npln/common"
+	_ "github.com/NextendoNetwork/splatoon-3/gen/third_party/googleapi"
+	googlerpc "github.com/NextendoNetwork/splatoon-3/gen/third_party/googlerpc"
+	_ "github.com/NextendoNetwork/splatoon-3/gen/third_party/validate"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"

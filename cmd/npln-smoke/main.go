@@ -11,11 +11,11 @@
 // It asserts the behaviours that must hold, and exits non-zero on the first
 // failure:
 //
-//	1. a request with no npln-tenant-id is refused (Unimplemented, as retail does)
-//	2. an anonymous token can be issued
-//	3. the social services REFUSE the anonymous user
-//	4. the schedule covers now and is contiguous
-//	5. a console that resolves to no Nextendo account is refused (fail-closed)
+//  1. a request with no npln-tenant-id is refused (Unimplemented, as retail does)
+//  2. an anonymous token can be issued
+//  3. the social services REFUSE the anonymous user
+//  4. the schedule covers now and is contiguous
+//  5. a console that resolves to no Nextendo account is refused (fail-closed)
 //
 // Test 5 is the important one. It is the invariant the Switch friend bug came
 // from: a server that answers "some account" instead of an error lets one console
@@ -37,9 +37,9 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	authv1 "github.com/n-popescu/splatoon-3/gen/npln/auth/v1"
-	friendsv1 "github.com/n-popescu/splatoon-3/gen/npln/friends/v1"
-	toyohrv1 "github.com/n-popescu/splatoon-3/gen/npln/toyohr/v1"
+	authv1 "github.com/NextendoNetwork/splatoon-3/gen/npln/auth/v1"
+	friendsv1 "github.com/NextendoNetwork/splatoon-3/gen/npln/friends/v1"
+	toyohrv1 "github.com/NextendoNetwork/splatoon-3/gen/npln/toyohr/v1"
 )
 
 func main() {

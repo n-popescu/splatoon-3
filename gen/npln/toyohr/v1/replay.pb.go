@@ -7,7 +7,7 @@
 package toyohrv1
 
 import (
-	v1 "github.com/n-popescu/splatoon-3/gen/npln/ugcstore/v1"
+	v1 "github.com/NextendoNetwork/splatoon-3/gen/npln/ugcstore/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"

@@ -45,7 +45,7 @@ dies silently after a successful TLS handshake. With the patch applied, set
 | Port | What |
 | --- | --- |
 | `:443` | gRPC/HTTP2 + TLS — the tenant endpoint (via `sni-router`, or directly) |
-| `:8087` | plain HTTP — `/api/stats` for the dashboard, `/ugc/*` for attachments (private network only) |
+| `:8088` | plain HTTP — `DASH_PORT`: `/api/stats`, `/healthz`, `/ugc/*` (private network only). 8088 because the fleet already uses 8082–8087 |
 | `3478` | your STUN/TURN server (not this process) |
 
 ## Configuration
@@ -118,7 +118,7 @@ cp example.env .env      # edit it
 mkdir -p data
 cp schedule.example.json schedule.json          # then edit with real content data
 cp matchmaking.example.json data/matchmaking.json
-go build -o splatoon-3 ./cmd/splatoon-3
+go build -o splatoon-3 .
 ./splatoon-3
 ```
 
@@ -145,7 +145,7 @@ services:
       NPLN_STUN_HOST: "SERVER_IP"
       NPLN_TURN_HOST: "SERVER_IP"
       NPLN_TURN_SECRET: "change-me"          # SAME as coturn
-      NPLN_ATTACHMENT_BASE_URL: "http://splatoon3:8087"
+      NPLN_ATTACHMENT_BASE_URL: "http://splatoon3:8088"
       DASH_TOKEN: "change-me"
     volumes:
       - ./certs:/certs:ro
@@ -172,7 +172,7 @@ next to the NEX games.
 **`nextendo-account`** — add this server to `gameStatsURLs()` in `online_presence.go`:
 
 ```go
-env("DASH_S3_URL", "http://splatoon3:8087"),
+env("DASH_S3_URL", "http://splatoon3:8088"),
 ```
 
 That is what makes the *one place at a time* gate see a Splatoon 3 player as playing, instead of
@@ -182,7 +182,7 @@ without it — this server pushes to `/internal/presence-batch`.)
 ## Verifying it works
 
 1. Start `nextendo-account`, then this server. The log prints the tenant and whether TLS is on.
-2. `curl "http://127.0.0.1:8087/api/stats?key=$DASH_TOKEN"` → JSON with zero players.
+2. `curl "http://127.0.0.1:8088/api/stats?key=$DASH_TOKEN"` → JSON with zero players.
 3. Point a client at it and enter online play. In order, the log should show:
    `IssuePrearrangedUserToken` (with a `pid=`), `SubscribeMaintenanceSchedules`, the `Schedule` calls,
    `Friends.*`, `PresenceService.KeepAlive`, then the matchmaking calls.
@@ -191,7 +191,7 @@ without it — this server pushes to `/internal/presence-batch`.)
 ## Security checklist
 
 - `/api/stats` is behind `DASH_TOKEN` and not reachable from the internet.
-- `:8087` (UGC + stats) stays on the private network; only `:443` faces clients.
+- `:8088` (UGC + stats) stays on the private network; only `:443` faces clients.
 - The data directory is not world-readable (`npln_signing_key.pem` signs every identity).
 - Secrets come from the environment or files, never from the repository.
 - `NEXTENDO_REQUIRE_SIGNED_TOKEN=1` if your deployment is emulator-only — it makes identity

@@ -7,8 +7,8 @@
 package matchmakingv1
 
 import (
-	common "github.com/n-popescu/splatoon-3/gen/npln/common"
-	_ "github.com/n-popescu/splatoon-3/gen/third_party/googleapi"
+	common "github.com/NextendoNetwork/splatoon-3/gen/npln/common"
+	_ "github.com/NextendoNetwork/splatoon-3/gen/third_party/googleapi"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"

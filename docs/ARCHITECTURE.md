@@ -42,8 +42,11 @@ speak a completely different protocol. Everything to the right of this server is
 ## Inside the server
 
 ```
-cmd/splatoon-3          the binary: configuration, wiring, shutdown
-internal/
+main.go                 the binary: configuration, wiring, shutdown
+gates.go                identity + the online gates (same contract as the NEX servers)
+revoked.go              the nx2 token denylist
+utility.go              envOr / envOrInt / loadNextendoSecret
+npln/
   config                every tunable, all from the environment
   identity              BAAS id_token → Nextendo account → NPLN ids
   token                 the ES256 access / matchmaking / delegation tokens

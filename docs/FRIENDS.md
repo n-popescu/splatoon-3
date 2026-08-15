@@ -71,7 +71,7 @@ life and were not used as such.
 
 **In this repository (Splatoon 3):**
 
-1. `internal/presence` reports every player currently in Splatoon 3 to
+1. `npln/presence` reports every player currently in Splatoon 3 to
    `/internal/presence-batch` every 30 s, with the Splatoon 3 title id. A player in Splatoon 3 is now
    visible as "playing Splatoon 3" to every friend, on a Switch, on the website, and in the other games.
 2. Presence is refreshed by *any* authenticated RPC (`Hub.Touch`), not just by the keepalive stream, so
@@ -163,7 +163,7 @@ A 404 from `pid-by-bsdid` sends `nx-account` back to that fallback, and the fall
 account. Combined with B1/B2, every console converges onto one identity: whoever set the server up.
 
 **This is the same class of bug this Splatoon 3 server is written to be immune to** — and why
-`internal/identity` refuses rather than guesses, with a test whose only job is to prove an unresolvable
+`npln/identity` refuses rather than guesses, with a test whose only job is to prove an unresolvable
 console does not become "some account".
 
 ### The fix
@@ -253,7 +253,7 @@ The NPLN friend model is not the Home Menu one, and two details are easy to get 
 - **Identity must line up exactly.** The account server publishes a friend as
   `u-<base32(HMAC(secret,"npln-user:"+pid))>`. This server derives the logged-in player's id with the
   *same* function. Two independent derivations of the same thing are a trap, so
-  `internal/identity/identity_test.go` re-implements the account server's version and asserts they are
+  `npln/identity/identity_test.go` re-implements the account server's version and asserts they are
   byte-identical. If somebody changes one, that test fails.
 - **Streams must stay warm.** `SubscribeFriendUsers` re-reads the graph every 15 s and force-sends a
   snapshot every 60 s; `SubscribePresences` sends the enumeration-done marker the client waits for and
@@ -266,7 +266,7 @@ The NPLN friend model is not the Home Menu one, and two details are easy to get 
 2. `[friends] ListFriendUsers pid=… -> N friend(s)` should show a non-zero N. Zero with a healthy
    account server means the derived user ids do not match — check that `NEXTENDO_SECRET` is identical.
 3. `[presence] pid=… state=ONLINE attrs=…` on both, then each should see the other as online in game.
-4. `curl "http://…:8087/api/stats?key=$DASH_TOKEN"` lists both players.
+4. `curl "http://…:8088/api/stats?key=$DASH_TOKEN"` lists both players.
 5. On the account server, `GET /internal/npln-friends?pid=<a>` should show `b` with a fresh presence
    (`status` 2) while `b` is playing.
 6. Have one console leave online play: the other should see them go offline within seconds (the

@@ -34,7 +34,7 @@ Sections: [A — server](#part-a--the-server) · [B — the `:443` edge](#part-b
 ```sh
 git clone https://github.com/NextendoNetwork/splatoon-3 && cd splatoon-3
 go build ./... && go test ./...          # 68 tests, all offline
-go build -o splatoon-3 ./cmd/splatoon-3
+go build -o splatoon-3 .
 ```
 
 ### A2. Configuration
@@ -107,7 +107,7 @@ address that does not exist for them.
 | `443` | TCP | **the console** | gRPC/HTTP2 + TLS, via `sni-router` or directly |
 | `3478` | **UDP** and TCP | **the console** | STUN/TURN |
 | `49160–49200` | UDP | **the console** | TURN relay range (must match coturn's `--min-port`/`--max-port`) |
-| `8087` | TCP | **private network only** | `/api/stats` and `/ugc/*` |
+| `8088` | TCP | **private network only** | `DASH_PORT` — `/api/stats`, `/healthz`, `/ugc/*` |
 
 The UDP rules are the ones people forget. A firewall that only opens TCP gives you a game that logs
 in, shows the lobby, and never starts a match.
@@ -238,7 +238,7 @@ debugging tractable.
 **D1 — the server is alive and configured.**
 
 ```sh
-curl "http://127.0.0.1:8087/api/stats?key=$DASH_TOKEN"
+curl "http://127.0.0.1:8088/api/stats?key=$DASH_TOKEN"
 ```
 
 JSON with zero players. `401` means `DASH_TOKEN` does not match; an empty reply means the process is
